@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import type { DesktopZoomPercent, TerminalAppearanceTheme } from '@sim/desktop-bridge'
 import { createLogger } from '@sim/logger'
 import { isLoopbackHostname } from '@sim/security/ssrf'
+import { generateShortId } from '@sim/utils/id'
 import { writeJsonFileAtomicallySync } from '@/main/atomic-json-file'
 import type { WindowsTerminalShell } from '@/main/terminal/default-shell'
 
@@ -88,8 +89,41 @@ export interface BrowserKnownSiteSetting {
   signInCompletedAt?: string
 }
 
+/**
+ * An identity the shell is signed in as: a server origin with its own cookie
+ * jar. The primary account is the `origin` setting itself; the rest live in
+ * `additionalAccounts`, so an install from before accounts reads unchanged.
+ */
+export interface Account {
+  id: string
+  origin: string
+  /** A user-chosen name; the origin's host when absent. */
+  label?: string
+}
+
+export const PRIMARY_ACCOUNT_ID = 'primary'
+
+export function isAccount(value: unknown): value is Account {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<Account>
+  return (
+    typeof candidate.id === 'string' &&
+    candidate.id.length > 0 &&
+    candidate.id !== PRIMARY_ACCOUNT_ID &&
+    typeof candidate.origin === 'string' &&
+    validateOriginInput(candidate.origin).ok &&
+    (candidate.label === undefined || typeof candidate.label === 'string')
+  )
+}
+
+export type AccountValidation = { ok: true; account: Account } | { ok: false; error: string }
+
 export interface DesktopSettings {
   origin: string
+  /** Accounts beyond the primary one; see {@link Account}. */
+  additionalAccounts?: Account[]
+  /** The last in-app route each non-primary account's window showed, by account id. */
+  accountRoutes?: Record<string, string>
   windowBounds?: WindowBounds
   zoomLevel?: number
   lastRoute?: string
@@ -246,6 +280,12 @@ export interface ConfigStore {
   isPersistenceAvailable(): boolean
   getOrigin(): string
   setOrigin(origin: string): OriginValidation
+  /** Every signed-in identity, the primary account first. Never empty. */
+  getAccounts(): Account[]
+  /** Adds an account for `origin` and persists it before returning. */
+  addAccount(origin: string, label?: string): AccountValidation
+  /** Removes a non-primary account; false when it is the primary or unknown. */
+  removeAccount(id: string): boolean
   get<K extends keyof DesktopSettings>(key: K): DesktopSettings[K]
   set<K extends keyof DesktopSettings>(key: K, value: DesktopSettings[K]): void
   /** Writes any debounced change immediately and reports whether persistence is healthy. */
@@ -321,6 +361,7 @@ export function createConfigStore(
   }
 
   let saveTimer: ReturnType<typeof setTimeout> | null = null
+  const currentOrigin = () => (envOverride?.ok ? envOverride.origin : settings.origin)
 
   /** Writes the whole file now and cancels any pending debounced write. */
   const writeNow = (): boolean => {
@@ -365,12 +406,7 @@ export function createConfigStore(
     isPersistenceAvailable() {
       return !persistenceBlocked
     },
-    getOrigin() {
-      if (envOverride?.ok) {
-        return envOverride.origin
-      }
-      return settings.origin
-    },
+    getOrigin: currentOrigin,
     setOrigin(raw: string) {
       const validated = validateOriginInput(raw)
       if (!validated.ok) {
@@ -413,6 +449,43 @@ export function createConfigStore(
         return { ok: false, error: 'Could not save the desktop settings file' }
       }
       return { ok: true, origin }
+    },
+    getAccounts() {
+      const additional = (settings.additionalAccounts ?? []).filter(isAccount)
+      return [{ id: PRIMARY_ACCOUNT_ID, origin: currentOrigin() }, ...additional]
+    },
+    addAccount(raw, label) {
+      const validated = validateOriginInput(raw)
+      if (!validated.ok) return validated
+      if (persistenceBlocked) {
+        return { ok: false, error: 'Could not save the desktop settings file' }
+      }
+      const account: Account = {
+        id: generateShortId(12),
+        origin: canonicalOrigin(validated.origin),
+        ...(label?.trim() ? { label: label.trim() } : {}),
+      }
+      const previous = settings.additionalAccounts
+      settings.additionalAccounts = [...(previous ?? []).filter(isAccount), account]
+      // Not debounced: the account's cookie jar is created the moment it is
+      // added, and a crash before the save would orphan that jar.
+      if (!writeNow()) {
+        settings.additionalAccounts = previous
+        return { ok: false, error: 'Could not save the desktop settings file' }
+      }
+      return { ok: true, account }
+    },
+    removeAccount(id) {
+      if (id === PRIMARY_ACCOUNT_ID) return false
+      const previous = (settings.additionalAccounts ?? []).filter(isAccount)
+      const remaining = previous.filter((account) => account.id !== id)
+      if (remaining.length === previous.length) return false
+      settings.additionalAccounts = remaining
+      if (settings.accountRoutes && id in settings.accountRoutes) {
+        const { [id]: _removed, ...routes } = settings.accountRoutes
+        settings.accountRoutes = routes
+      }
+      return writeNow()
     },
     get(key) {
       return settings[key]

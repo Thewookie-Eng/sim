@@ -387,7 +387,7 @@ describe('registerIpcHandlers', () => {
     expect(deps.beginOAuthConnect).not.toHaveBeenCalled()
     expect(await handler?.(activeAppEvent, 42)).toBe(false)
     expect(await handler?.(activeAppEvent, 'slack')).toBe(true)
-    expect(deps.beginOAuthConnect).toHaveBeenCalledWith('slack', {})
+    expect(deps.beginOAuthConnect).toHaveBeenCalledWith(activeAppEvent.sender, 'slack', {})
 
     // Connects carry workspace/credential or exact-draft scope; malformed
     // scopes (wrong types, unsafe ids) are rejected before the handoff.
@@ -399,7 +399,7 @@ describe('registerIpcHandlers', () => {
         chatAttemptId: 'attempt_1',
       })
     ).toBe(true)
-    expect(deps.beginOAuthConnect).toHaveBeenCalledWith('slack', {
+    expect(deps.beginOAuthConnect).toHaveBeenCalledWith(activeAppEvent.sender, 'slack', {
       workspaceId: 'ws1',
       credentialId: 'cred_1',
       draftId: 'draft_1',

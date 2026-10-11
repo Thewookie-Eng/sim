@@ -213,6 +213,10 @@ Raw local file bytes are never exposed through the preload bridge and cannot be 
 - Rollback: a pulled release must be superseded by a **higher** version — users on the broken build will not reinstall an equal one. (A blocked-versions kill-switch was removed as unwired dead code; reintroduce it in `updater.ts` if a remote config source ever exists to feed it.)
 - Ship the DMG and tell users to install to `/Applications` — App Translocation breaks Squirrel.Mac updates from quarantined paths.
 
+## Accounts
+
+Several accounts can be signed in at once, each in its own windows: another login on the same server, or a self-hosted deployment beside sim.ai. The primary account is the `origin` setting on its original partition (`persist:sim`), so existing installs stay signed in; the rest are `additionalAccounts` in `settings.json`, each with a jar keyed by its id (`persist:sim-account-<id>`). `src/main/accounts.ts` holds the model; `index.ts` keeps one runtime per account (session, handoffs, lifecycle coordinator) and binds every full window to one. The navigation guards and the IPC origin gate resolve the origin per renderer. **Accounts** in the app menu lists, focuses, adds (the server picker in `add-account` mode) and removes accounts. Still process-wide and following the primary account: chat/terminal snapshots, folder grants, the agent browser profile, the executor device, and the tray.
+
 ## Self-hosting
 
 - Point Settings… (`Cmd+,`) at your instance. HTTPS required (HTTP for localhost only); each origin gets an isolated cookie partition.

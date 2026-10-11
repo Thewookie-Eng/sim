@@ -199,6 +199,11 @@ export interface CreateMainWindowDeps {
   preloadPath: string
   isPackaged: boolean
   onClosed: () => void
+  /**
+   * Receives each in-app route the window settles on. Defaults to the global
+   * `lastRoute` setting; windows of other accounts keep their own.
+   */
+  onRouteChange?: (route: string) => void
   /** A committed process restart must not be cancelled by a renderer's beforeunload handler. */
   isCommittedRelaunchPending: () => boolean
   onFullScreenChange?: (isFullScreen: boolean) => void
@@ -404,9 +409,9 @@ export function createMainWindow(deps: CreateMainWindowDeps): BrowserWindow {
     }
     clearTimeout(routeTimer)
     routeTimer = setTimeout(() => {
-      if (!win.isDestroyed()) {
-        deps.config.set('lastRoute', path)
-      }
+      if (win.isDestroyed()) return
+      if (deps.onRouteChange) deps.onRouteChange(path)
+      else deps.config.set('lastRoute', path)
     }, ROUTE_SAVE_DELAY_MS)
   }
   win.webContents.on('did-navigate', (_event, url) => recordRoute(url))

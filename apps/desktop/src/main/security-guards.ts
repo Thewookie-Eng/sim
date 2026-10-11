@@ -9,11 +9,12 @@ import { scrubUrl } from '@/main/observability'
 const logger = createLogger('DesktopSecurityGuards')
 
 export interface GuardDeps {
-  appOrigin: () => string
+  /** The Sim origin the given renderer belongs to; windows of different accounts differ. */
+  appOrigin: (contents: WebContents) => string
   isPackaged: boolean
   allowHttpLocalhost: () => boolean
   isPopupContents: (contents: WebContents) => boolean
-  onLoginHandoff: () => void
+  onLoginHandoff: (contents: WebContents) => void
   onConnectIntercept: (contents: WebContents) => void
 }
 
@@ -33,7 +34,7 @@ export function attachNavigationGuards(contents: WebContents, deps: GuardDeps): 
       return
     }
     const action = classifyNavigation(url, {
-      appOrigin: deps.appOrigin(),
+      appOrigin: deps.appOrigin(contents),
       currentUrl: contents.getURL(),
       isPopup: deps.isPopupContents(contents),
     })
@@ -46,7 +47,7 @@ export function attachNavigationGuards(contents: WebContents, deps: GuardDeps): 
         return
       case 'idp-system-login':
         event.preventDefault()
-        deps.onLoginHandoff()
+        deps.onLoginHandoff(contents)
         return
       case 'idp-system-connect':
         event.preventDefault()

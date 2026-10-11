@@ -84,10 +84,17 @@ export interface ServerWindowDeps {
    * already performs the orderly teardown, so relaunching reuses it.
    */
   relaunch: () => void
+  /**
+   * Signs in to another account at `origin` alongside the ones already open —
+   * no teardown and no relaunch, since nothing existing moves.
+   */
+  addAccount: (origin: string) => Promise<DesktopServerChangeResult>
 }
 
+export type ServerWindowPurpose = NonNullable<DesktopServerConfiguration['purpose']>
+
 export interface ServerWindowHandle {
-  open(): void
+  open(purpose?: ServerWindowPurpose): void
   getConfiguration(): DesktopServerConfiguration
   setOrigin(origin: string): Promise<DesktopServerChangeResult>
 }
@@ -106,10 +113,19 @@ export function createServerWindow(deps: ServerWindowDeps): ServerWindowHandle {
   let win: BrowserWindow | null = null
   /** Prevents concurrent IPC requests from interleaving server teardown and persistence. */
   let changeInFlight = false
+  /** What the open window does with the URL it is given. */
+  let purpose: ServerWindowPurpose = 'server'
 
   const getConfiguration = (): DesktopServerConfiguration => {
-    const origin = deps.config.getOrigin()
-    return { origin, defaultOrigin: deps.defaultOrigin, isSimCloud: isSimCloudOrigin(origin) }
+    // Adding an account starts from this build's default server: most second
+    // accounts are another login on the same deployment.
+    const origin = purpose === 'add-account' ? deps.defaultOrigin : deps.config.getOrigin()
+    return {
+      origin,
+      defaultOrigin: deps.defaultOrigin,
+      isSimCloud: isSimCloudOrigin(origin),
+      purpose,
+    }
   }
 
   const close = (): void => {
@@ -119,12 +135,19 @@ export function createServerWindow(deps: ServerWindowDeps): ServerWindowHandle {
     win = null
   }
 
-  const open = (): void => {
+  const open = (requestedPurpose: ServerWindowPurpose = 'server'): void => {
     if (win && !win.isDestroyed()) {
-      win.show()
-      win.focus()
-      return
+      // A window already open for the other purpose shows the other copy;
+      // close it so the page reloads with the right one.
+      if (purpose !== requestedPurpose) {
+        close()
+      } else {
+        win.show()
+        win.focus()
+        return
+      }
     }
+    purpose = requestedPurpose
     const parent = deps.getParentWindow()
     // Every other session in the app installs a permission handler; without one
     // Electron decides for itself what a page may ask the OS for. The page here
@@ -221,6 +244,19 @@ export function createServerWindow(deps: ServerWindowDeps): ServerWindowHandle {
     const validated = validateOriginInput(raw)
     if (!validated.ok) {
       return validated
+    }
+    if (purpose === 'add-account') {
+      if (changeInFlight) {
+        return { ok: false, error: 'An account is already being added.' }
+      }
+      changeInFlight = true
+      try {
+        const result = await deps.addAccount(validated.origin)
+        if (result.ok) close()
+        return result
+      } finally {
+        changeInFlight = false
+      }
     }
     // Same canonicalization the store applies, so the comparison below matches
     // what would actually be written.

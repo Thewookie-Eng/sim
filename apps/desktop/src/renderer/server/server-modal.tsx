@@ -26,12 +26,13 @@ function mountServerModal(element: HTMLDivElement | null) {
 }
 
 export function ServerModal({ server, configuration, initialError }: ServerModalProps) {
+  const addingAccount = configuration?.purpose === 'add-account'
   const requestInFlight = useRef(false)
   const [origin, setOrigin] = useState(configuration?.origin ?? '')
   const [pending, setPending] = useState(false)
   const [error, setError] = useState(initialError)
   const [message, setMessage] = useState(
-    configuration && configuration.origin !== configuration.defaultOrigin
+    configuration && !addingAccount && configuration.origin !== configuration.defaultOrigin
       ? `This build defaults to ${configuration.defaultOrigin}`
       : ''
   )
@@ -50,7 +51,9 @@ export function ServerModal({ server, configuration, initialError }: ServerModal
         setMessage('Already connected to this server.')
       }
     } catch {
-      setError('The server could not be changed.')
+      setError(
+        addingAccount ? 'The account could not be added.' : 'The server could not be changed.'
+      )
     } finally {
       requestInFlight.current = false
       setPending(false)
@@ -70,12 +73,13 @@ export function ServerModal({ server, configuration, initialError }: ServerModal
         onClose={closeWindow}
         className='[-webkit-app-region:drag] [&_button]:[-webkit-app-region:no-drag]'
       >
-        <span id='server-title'>Sim server</span>
+        <span id='server-title'>{addingAccount ? 'Add account' : 'Sim server'}</span>
       </ChipModalHeader>
       <ChipModalBody>
         <ChipModalDescription id='server-description'>
-          Point this app at your own Sim deployment. Self-hosted servers must use HTTPS; localhost
-          may use HTTP.
+          {addingAccount
+            ? 'Sign in to another account in its own window. Enter the server it lives on — the same one again, or a self-hosted deployment.'
+            : 'Point this app at your own Sim deployment. Self-hosted servers must use HTTPS; localhost may use HTTP.'}
         </ChipModalDescription>
         <ChipModalField
           type='input'

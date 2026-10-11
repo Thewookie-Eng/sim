@@ -39,6 +39,7 @@ function makeDeps(overrides: Partial<ServerWindowDeps> = {}): ServerWindowDeps {
     clearDeploymentScopedState: vi.fn(async (): Promise<readonly string[]> => []),
     completeDeploymentScopedStateChange: vi.fn((commit) => commit()),
     relaunch: vi.fn(),
+    addAccount: vi.fn(async () => ({ ok: true as const, origin: '', unchanged: false })),
     ...overrides,
   }
 }

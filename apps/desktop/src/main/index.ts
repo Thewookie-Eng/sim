@@ -23,6 +23,7 @@ import {
   retryAccountDataTeardown,
   waitForAccountDataMutations,
 } from '@/main/account-data-generation'
+import { accountDisplayName, partitionForAccount } from '@/main/accounts'
 import { newChatRoute, settingsRoute } from '@/main/app-routes'
 import {
   activateBrowserScope as activateAgentBrowserScope,
@@ -50,12 +51,13 @@ import {
 } from '@/main/browser-agent/session'
 import { attachClientInfo } from '@/main/client-info'
 import {
+  type Account,
   APP_NAME_FOR_CHANNEL,
   channelForOrigin,
   createConfigStore,
   DEFAULT_ORIGIN,
   isSafeInternalPath,
-  partitionForOrigin,
+  PRIMARY_ACCOUNT_ID,
 } from '@/main/config'
 import { attachContextMenu } from '@/main/context-menu'
 import { attachCspFallback } from '@/main/csp'
@@ -148,12 +150,26 @@ function main(): void {
   const accountDataAvailable = () =>
     config.isPersistenceAvailable() && !isAccountDataTeardownRequired()
   const events = createEventLog(join(userDataPath, 'logs'))
-  const appOrigin = () => config.getOrigin()
+  const accounts = () => config.getAccounts()
+  const primaryAccount = () => accounts()[0]
+  const accountById = (id: string) => accounts().find((account) => account.id === id) ?? null
   /** Resource snapshots stay with the deployment that created this process. */
-  const processOrigin = appOrigin()
+  const processOrigin = primaryAccount().origin
   const recoveryPartition = `sim-settings-recovery-${process.pid}`
-  const appPartition = (origin = appOrigin()) =>
-    accountDataAvailable() ? partitionForOrigin(origin) : recoveryPartition
+  const accountPartition = (account: Account) =>
+    accountDataAvailable() ? partitionForAccount(account) : recoveryPartition
+  /** The route an account's next window opens on. The primary keeps the legacy setting. */
+  const lastRouteFor = (account: Account) =>
+    account.id === PRIMARY_ACCOUNT_ID
+      ? config.get('lastRoute')
+      : config.get('accountRoutes')?.[account.id]
+  const setLastRoute = (account: Account, route: string) => {
+    if (account.id === PRIMARY_ACCOUNT_ID) {
+      config.set('lastRoute', route)
+      return
+    }
+    config.set('accountRoutes', { ...(config.get('accountRoutes') ?? {}), [account.id]: route })
+  }
   const desktopChatSessions = new DesktopChatSessionStore(
     join(userDataPath, 'desktop-chat-sessions.json')
   )
@@ -187,19 +203,22 @@ function main(): void {
   const preloadPath = join(__dirname, 'preload.cjs')
 
   const windows = new Set<BrowserWindow>()
+  /** Which account each full Sim window belongs to; set before the window loads. */
+  const windowAccounts = new WeakMap<BrowserWindow, Account>()
   const loadHealthByWindow = new Map<BrowserWindow, LoadHealthHandle>()
   let lastActiveWindow: BrowserWindow | null = null
-  let ensureWindowCreation: Promise<BrowserWindow> | null = null
-  let appSession: Session | null = null
-  let sessionLifecycle: ReturnType<typeof createSessionLifecycleCoordinator> | null = null
+  const windowCreations = new Map<string, Promise<BrowserWindow>>()
   let resumingQuitAfterTeardown = false
   let committedRelaunchPending = false
   let tray: TrayHandle | null = null
   let updater: UpdaterHandle | null = null
   let startupReady: Promise<void> | null = null
+  /** Rebuilt whenever the account list changes; assigned once the menu exists. */
+  let rebuildMenu: () => void = () => {}
   const configuredPartitions = new Set<string>()
 
-  const allowHttpLocalhost = () => !app.isPackaged || appOrigin().startsWith('http://')
+  const allowHttpLocalhost = () =>
+    !app.isPackaged || accounts().some((account) => account.origin.startsWith('http://'))
   const getWindows = () => [...windows].filter((win) => !win.isDestroyed())
   const getMainWindow = () => {
     const focused = BrowserWindow.getFocusedWindow()
@@ -221,6 +240,40 @@ function main(): void {
     const focused = BrowserWindow.getFocusedWindow()
     return focused && windows.has(focused) && !focused.isDestroyed() ? focused : null
   }
+  const windowsFor = (account: Account) =>
+    getWindows().filter((win) => windowAccounts.get(win)?.id === account.id)
+  /** The focused or most recent window of an account, or null when it has none open. */
+  const mainWindowFor = (account: Account) => {
+    const current = getMainWindow()
+    if (current && windowAccounts.get(current)?.id === account.id) return current
+    return windowsFor(account).at(-1) ?? null
+  }
+  /**
+   * The account global surfaces act for — the menu's Sign Out, the tray, a
+   * keyboard shortcut. The one whose window the user is in, else the primary.
+   */
+  const activeAccount = (): Account => {
+    const win = getMainWindow()
+    const bound = win ? windowAccounts.get(win) : undefined
+    return (bound && accountById(bound.id)) ?? primaryAccount()
+  }
+  const appOrigin = () => activeAccount().origin
+  /**
+   * The account a renderer belongs to. Full windows are bound directly; a
+   * popup (MCP OAuth, blank child) shares its opener's partition, so it is
+   * matched by session. Anything else is answered for the active account —
+   * and then still has to pass the origin check against it.
+   */
+  const accountForContents = (contents: WebContents): Account => {
+    const win = BrowserWindow.fromWebContents(contents)
+    const bound = win ? windowAccounts.get(win) : undefined
+    if (bound) return accountById(bound.id) ?? bound
+    for (const runtime of runtimes.values()) {
+      if (runtime.session === contents.session) return runtime.account
+    }
+    return activeAccount()
+  }
+  const originForContents = (contents: WebContents) => accountForContents(contents).origin
   const broadcast = (channel: string, ...args: unknown[]) => {
     for (const win of getWindows()) {
       win.webContents.send(channel, ...args)
@@ -240,89 +293,107 @@ function main(): void {
     app.focus({ steal: true })
   }
 
-  const handoff = createHandoffManager(
-    {
-      origin: appOrigin,
-      openExternal: (url) => openExternalSafe(url, allowHttpLocalhost()),
-      events,
-      currentUserId: () => readSessionUserId(ensureAppSession(), appOrigin()),
-    },
-    {
-      onLogin: (callback) => void authFlow.handleCallback(callback).catch(reportHandoffFailure),
-      onConnect: (callback) => connectFlow.handleCallback(callback),
-    }
-  )
-
-  const authFlow = createAuthFlow({
-    handoff,
-    origin: appOrigin,
-    events,
-    ensureMainWindow: async () => {
-      let win = getMainWindow()
-      if (!win) {
-        win = await ensureMainWindow()
-      }
-      if (!win) {
-        throw new Error('Main window unavailable')
-      }
-      return win
-    },
-  })
-
-  const connectFlow = createConnectFlow({
-    handoff,
-    events,
-    focusMainWindow: showMainWindow,
-    notifyRenderer: (result) => {
-      broadcast('desktop:oauth-connect-complete', result)
-    },
-  })
-
   installGlobalGuards({
-    appOrigin,
+    appOrigin: originForContents,
     isPackaged: app.isPackaged,
     allowHttpLocalhost,
     isPopupContents,
-    onLoginHandoff: () => void authFlow.beginLoginHandoff().catch(reportHandoffFailure),
+    onLoginHandoff: (contents) =>
+      void runtimeForContents(contents).authFlow.beginLoginHandoff().catch(reportHandoffFailure),
     onConnectIntercept: (contents) => void handleConnectIntercept(contents, allowHttpLocalhost()),
   })
 
-  function configureSessionForOrigin(origin: string) {
-    const partition = appPartition(origin)
+  function configureSessionForAccount(account: Account) {
+    const partition = accountPartition(account)
     const ses = session.fromPartition(partition)
     if (configuredPartitions.has(partition)) {
       return ses
     }
     configuredPartitions.add(partition)
-    setupPermissionHandlers(ses, appOrigin)
+    const origin = () => account.origin
+    setupPermissionHandlers(ses, origin)
     attachLocalPageProtocol(ses)
-    attachCspFallback(ses, appOrigin)
-    attachClientInfo(ses, appOrigin)
+    attachCspFallback(ses, origin)
+    attachClientInfo(ses, origin)
     attachDownloadHandling(ses, events)
     attachTelemetryPolicy(ses, config.get('blockThirdPartyAnalytics') ?? true)
     ses.setSpellCheckerLanguages(['en-US'])
     return ses
   }
 
-  function ensureAppSession(): Session {
-    if (appSession && sessionLifecycle) return appSession
-    const ses = configureSessionForOrigin(appOrigin())
-    appSession = ses
-    sessionLifecycle = createSessionLifecycleCoordinator({
-      appSession: ses,
-      origin: appOrigin,
+  /**
+   * Everything that exists once per signed-in account: its session, the
+   * sign-in and connect handoffs that land cookies in it, and the lifecycle
+   * coordinator that tears it down. Windows are many per account; these are
+   * not.
+   */
+  interface AccountRuntime {
+    account: Account
+    session: Session
+    handoff: ReturnType<typeof createHandoffManager>
+    authFlow: ReturnType<typeof createAuthFlow>
+    connectFlow: ReturnType<typeof createConnectFlow>
+    lifecycle: ReturnType<typeof createSessionLifecycleCoordinator>
+  }
+  const runtimes = new Map<string, AccountRuntime>()
+  const runtimeForContents = (contents: WebContents) => ensureRuntime(accountForContents(contents))
+  const primaryRuntime = () => ensureRuntime(primaryAccount())
+
+  function ensureRuntime(account: Account): AccountRuntime {
+    const existing = runtimes.get(account.id)
+    if (existing) return existing
+    const origin = () => account.origin
+    const ses = configureSessionForAccount(account)
+    const isPrimary = account.id === PRIMARY_ACCOUNT_ID
+
+    const handoff = createHandoffManager(
+      {
+        origin,
+        openExternal: (url) => openExternalSafe(url, allowHttpLocalhost()),
+        events,
+        currentUserId: () => readSessionUserId(ses, account.origin),
+      },
+      {
+        onLogin: (callback) => void authFlow.handleCallback(callback).catch(reportHandoffFailure),
+        onConnect: (callback) => connectFlow.handleCallback(callback),
+      }
+    )
+    const authFlow = createAuthFlow({
+      handoff,
+      origin,
       events,
-      getWindows,
+      ensureMainWindow: () => ensureMainWindow(account),
+    })
+    const connectFlow = createConnectFlow({
+      handoff,
+      events,
+      focusMainWindow: () => showMainWindow(mainWindowFor(account)),
+      notifyRenderer: (result) => {
+        for (const win of windowsFor(account)) {
+          win.webContents.send('desktop:oauth-connect-complete', result)
+        }
+      },
+    })
+    const lifecycle = createSessionLifecycleCoordinator({
+      appSession: ses,
+      origin,
+      events,
+      getWindows: () => windowsFor(account),
       clearHandoffState: async () => {
         const stores = [
-          { label: 'sign-in handoff state', clear: () => handoff.clear() },
-          { label: 'recent tasks', clear: () => tray?.clearRecentChats() },
+          {
+            label: 'sign-in handoff state',
+            clear: () => {
+              for (const runtime of runtimes.values()) runtime.handoff.clear()
+            },
+          },
+          ...(isPrimary ? [{ label: 'recent tasks', clear: () => tray?.clearRecentChats() }] : []),
           {
             label: 'renderer session state',
             clear: () =>
               Promise.all(
-                getWindows()
-                  .filter((win) => canRevokeIn(win, appOrigin()))
+                windowsFor(account)
+                  .filter((win) => canRevokeIn(win, account.origin))
                   .map((win) =>
                     win.webContents.executeJavaScript(
                       `(() => { sessionStorage.clear(); window.name = '' })()`,
@@ -334,13 +405,20 @@ function main(): void {
           // Shells are account-scoped runtime state. Leaving them alive across
           // sign-out would stream the previous account's output into the next
           // renderer and keep its local processes running invisibly.
-          {
-            label: 'background executor',
-            clear: async () => {
-              approvalNotifier.clear()
-              await desktopExecutor.signOut()
-            },
-          },
+          //
+          // The executor, terminals, task state and folder grants are still
+          // process-wide, so signing out of any account clears them for all.
+          ...(isPrimary
+            ? [
+                {
+                  label: 'background executor',
+                  clear: async () => {
+                    approvalNotifier.clear()
+                    await desktopExecutor.signOut()
+                  },
+                },
+              ]
+            : []),
           {
             label: 'terminal sessions',
             // Agent commands are stopped by their own process groups first: closing a shell only
@@ -384,29 +462,40 @@ function main(): void {
         }
       },
     })
-    return ses
+    const runtime: AccountRuntime = {
+      account,
+      session: ses,
+      handoff,
+      authFlow,
+      connectFlow,
+      lifecycle,
+    }
+    runtimes.set(account.id, runtime)
+    return runtime
   }
 
-  async function ensureMainWindow(): Promise<BrowserWindow> {
-    const existing = getMainWindow()
+  /** An account's window, creating its first one; single-flight per account. */
+  async function ensureMainWindow(account: Account = primaryAccount()): Promise<BrowserWindow> {
+    const existing = mainWindowFor(account)
     if (existing) return existing
-    if (ensureWindowCreation) return ensureWindowCreation
+    const inFlight = windowCreations.get(account.id)
+    if (inFlight) return inFlight
 
-    const pending = createAndLoadAppWindow({ restorePosition: true })
-    ensureWindowCreation = pending
+    const pending = createAndLoadAppWindow({ account, restorePosition: true })
+    windowCreations.set(account.id, pending)
     try {
       return await pending
     } finally {
-      if (ensureWindowCreation === pending) {
-        ensureWindowCreation = null
+      if (windowCreations.get(account.id) === pending) {
+        windowCreations.delete(account.id)
       }
     }
   }
 
-  function routeFromAppUrl(rawUrl: string): string | null {
+  function routeFromAppUrl(rawUrl: string, origin: string): string | null {
     try {
       const url = new URL(rawUrl)
-      if (url.origin !== appOrigin()) return null
+      if (url.origin !== origin) return null
       const route = `${url.pathname}${url.search}${url.hash}`
       return isSafeInternalPath(route) ? route : null
     } catch {
@@ -415,27 +504,30 @@ function main(): void {
   }
 
   async function createAndLoadAppWindow({
+    account = primaryAccount(),
     route: requestedRouteOverride,
     restorePosition = false,
   }: {
+    account?: Account
     route?: string
     restorePosition?: boolean
   } = {}): Promise<BrowserWindow> {
-    const origin = appOrigin()
-    const ses = ensureAppSession()
-    const requestedRoute = decideStartRoute(requestedRouteOverride ?? config.get('lastRoute'))
-    const route = await resolveStartRoute(ses, origin, requestedRoute)
+    const origin = account.origin
+    const runtime = ensureRuntime(account)
+    const requestedRoute = decideStartRoute(requestedRouteOverride ?? lastRouteFor(account))
+    const route = await resolveStartRoute(runtime.session, origin, requestedRoute)
     if (route !== requestedRoute) {
-      config.set('lastRoute', route)
+      setLastRoute(account, route)
     }
     const win = createMainWindow({
       config,
       events,
-      appOrigin,
-      partition: appPartition(origin),
+      appOrigin: () => account.origin,
+      partition: accountPartition(account),
       preloadPath,
       isPackaged: app.isPackaged,
       restorePosition,
+      onRouteChange: (path) => setLastRoute(account, path),
       isCommittedRelaunchPending: () => committedRelaunchPending,
       onFullScreenChange: (isFullScreen) => {
         if (!win.isDestroyed()) {
@@ -452,6 +544,7 @@ function main(): void {
       },
     })
     windows.add(win)
+    windowAccounts.set(win, account)
     lastActiveWindow = win
     win.on('focus', () => {
       lastActiveWindow = win
@@ -463,11 +556,11 @@ function main(): void {
       setBrowserAgentPanelBounds(null, win)
     })
     attachWindowOpenPolicy(win.webContents, {
-      appOrigin,
+      appOrigin: () => account.origin,
       openAppWindow: (url) => {
-        const route = routeFromAppUrl(url)
+        const route = routeFromAppUrl(url, account.origin)
         if (route) {
-          void createAndLoadAppWindow({ route })
+          void createAndLoadAppWindow({ account, route })
         }
       },
       allowHttpLocalhost: allowHttpLocalhost(),
@@ -479,12 +572,12 @@ function main(): void {
     })
     const loadHealth = attachLoadHealth(win, {
       offlinePageUrl: (query) => localPageUrl('offline.html', query),
-      getStartUrl: () => `${appOrigin()}${route}`,
+      getStartUrl: () => `${account.origin}${route}`,
       isOnline: () => net.isOnline(),
       events,
     })
     loadHealthByWindow.set(win, loadHealth)
-    sessionLifecycle?.attachWindow(win)
+    runtime.lifecycle.attachWindow(win)
     loadHealth.startWatchdog()
     // Fire-and-forget: the window and all its handlers are wired synchronously
     // above, so callers get a usable window immediately and the app menu and
@@ -496,24 +589,65 @@ function main(): void {
 
   /** Opens the Sim app's settings page in the active window. */
   function openSettings(): void {
-    void openMainWindowAt(settingsRoute(config.get('lastRoute')))
+    const account = activeAccount()
+    void openMainWindowAt(settingsRoute(lastRouteFor(account)), account)
   }
 
   /**
-   * Brings the active window to front (creating one if needed), optionally
+   * Brings an account's window to front (creating one if needed), optionally
    * navigating it to an in-app route first — the seam used by the tray menu.
    */
-  async function openMainWindowAt(route?: string): Promise<void> {
-    let win = getMainWindow()
+  async function openMainWindowAt(
+    route?: string,
+    account: Account = activeAccount()
+  ): Promise<void> {
+    let win = mainWindowFor(account)
     if (!win) {
-      win = await createAndLoadAppWindow({ route, restorePosition: true })
+      win = await createAndLoadAppWindow({ account, route, restorePosition: true })
       showMainWindow(win)
       return
     }
     if (route) {
-      void win.loadURL(`${appOrigin()}${route}`).catch(() => {})
+      void win.loadURL(`${account.origin}${route}`).catch(() => {})
     }
     showMainWindow(win)
+  }
+
+  /**
+   * Adds an account for `origin` and opens its first window on the sign-in
+   * page. The other accounts' windows are untouched: nothing moves, so there
+   * is no teardown and no relaunch.
+   */
+  async function addAccount(origin: string) {
+    const added = config.addAccount(origin)
+    if (!added.ok) return added
+    const win = await createAndLoadAppWindow({ account: added.account, route: '/login' })
+    showMainWindow(win)
+    rebuildMenu()
+    return { ok: true as const, origin: added.account.origin, unchanged: false }
+  }
+
+  /**
+   * Signs an account out (revoking its server session and clearing its jar),
+   * closes its windows and forgets it. The primary account cannot be removed;
+   * it is the install's identity.
+   */
+  async function removeAccount(account: Account): Promise<void> {
+    if (account.id === PRIMARY_ACCOUNT_ID) return
+    const runtime = runtimes.get(account.id)
+    if (runtime) {
+      const clean = await runtime.lifecycle.signOut()
+      if (!clean) {
+        logger.error('Refusing to remove an account whose sign-out did not finish cleanly', {
+          account: accountDisplayName(account),
+        })
+        return
+      }
+    }
+    for (const win of windowsFor(account)) win.destroy()
+    runtimes.delete(account.id)
+    config.removeAccount(account.id)
+    rebuildMenu()
   }
 
   /** Installs or removes the menu-bar status item; safe to call repeatedly. */
@@ -524,11 +658,13 @@ function main(): void {
       return
     }
     if (!tray) {
+      // The tray speaks for the primary account; the others reach it through
+      // their own windows.
       tray = installTray({
-        partition: appPartition,
-        appOrigin,
+        partition: () => accountPartition(primaryAccount()),
+        appOrigin: () => primaryAccount().origin,
         lastRoute: () => config.get('lastRoute'),
-        openMainWindow: (route) => void openMainWindowAt(route),
+        openMainWindow: (route) => void openMainWindowAt(route, primaryAccount()),
       })
     }
   }
@@ -587,18 +723,21 @@ function main(): void {
     focusedChatId: () => {
       const win = focusedAppWindow()
       if (!win) return null
-      const route = routeFromAppUrl(win.webContents.getURL())
+      const origin = windowAccounts.get(win)?.origin ?? appOrigin()
+      const route = routeFromAppUrl(win.webContents.getURL(), origin)
       return route ? (/\/chat\/([^/?#]+)/.exec(route)?.[1] ?? null) : null
     },
-    openRoute: (route) => void openMainWindowAt(route),
+    openRoute: (route) => void openMainWindowAt(route, primaryAccount()),
     createNotification: (options) =>
       Notification.isSupported() ? new Notification(options) : null,
   })
 
+  // The executor registers one device per install, bound to the primary
+  // account's session; other accounts' chats run their tools in the foreground.
   const desktopExecutor = createDesktopExecutorService({
     userDataPath,
-    origin: appOrigin,
-    appSession: ensureAppSession,
+    origin: () => primaryAccount().origin,
+    appSession: () => primaryRuntime().session,
     preferences: () => desktopSettings.getPreferences(),
     accountDataAvailable,
     onApprovals: (items) => approvalNotifier.update(items),
@@ -632,7 +771,9 @@ function main(): void {
     preloadPath,
     isPackaged: app.isPackaged,
     getParentWindow: getMainWindow,
-    prepareDeploymentScopedStateChange: () => beginAccountDataTeardown('deployment', appOrigin()),
+    addAccount,
+    prepareDeploymentScopedStateChange: () =>
+      beginAccountDataTeardown('deployment', primaryAccount().origin),
     clearDeploymentScopedState: async () => {
       await waitForAccountDataMutations()
       // allSettled, not sequential awaits: these are independent stores, and a
@@ -671,8 +812,15 @@ function main(): void {
    * a second concurrent teardown.
    */
   function signOutFromMenu(): void {
-    ensureAppSession()
-    void sessionLifecycle?.signOut()
+    void ensureRuntime(activeAccount()).lifecycle.signOut()
+  }
+
+  /** Every account's teardown settled; false if any did not finish cleanly. */
+  const awaitAllTeardowns = async (): Promise<boolean> => {
+    const outcomes = await Promise.all(
+      [...runtimes.values()].map((runtime) => runtime.lifecycle.awaitTeardown())
+    )
+    return outcomes.every(Boolean)
   }
 
   app.on('second-instance', () => {
@@ -686,9 +834,12 @@ function main(): void {
   })
 
   app.on('before-quit', (event) => {
-    if (!resumingQuitAfterTeardown && sessionLifecycle?.isTeardownActive()) {
+    const teardownActive = [...runtimes.values()].some((runtime) =>
+      runtime.lifecycle.isTeardownActive()
+    )
+    if (!resumingQuitAfterTeardown && teardownActive) {
       event.preventDefault()
-      void sessionLifecycle.awaitTeardown().then((clean) => {
+      void awaitAllTeardowns().then((clean) => {
         if (!clean && !committedRelaunchPending) {
           logger.error('Quit cancelled because account teardown did not finish safely')
           return
@@ -768,7 +919,12 @@ function main(): void {
         },
         ...(kind === 'account' && origin
           ? [
-              { label: 'sign-in handoff state', clear: () => handoff.clear() },
+              {
+                label: 'sign-in handoff state',
+                clear: () => {
+                  for (const runtime of runtimes.values()) runtime.handoff.clear()
+                },
+              },
               { label: 'background executor', clear: () => desktopExecutor.signOut() },
               {
                 label: 'terminal sessions',
@@ -780,10 +936,15 @@ function main(): void {
               { label: 'task resource state', clear: clearDesktopChatSessions },
               {
                 label: 'app session storage',
+                // The marker names an origin, not an account; every jar on
+                // that origin is cleared rather than guessing which one.
                 clear: async () => {
-                  const persistedSession = session.fromPartition(partitionForOrigin(origin))
-                  await persistedSession.clearStorageData()
-                  await persistedSession.clearCache()
+                  for (const account of accounts()) {
+                    if (account.origin !== origin) continue
+                    const persistedSession = session.fromPartition(partitionForAccount(account))
+                    await persistedSession.clearStorageData()
+                    await persistedSession.clearCache()
+                  }
                 },
               },
             ]
@@ -847,7 +1008,7 @@ function main(): void {
       {
         getDirectory: () => desktopSettings.getPreferences().browserDownloadDirectory,
       },
-      { origin: processOrigin, session: ensureAppSession() },
+      { origin: processOrigin, session: primaryRuntime().session },
       localFilesystem
     )
     if (accountDataAvailable()) {
@@ -862,7 +1023,7 @@ function main(): void {
         scopeEvents.sendTerminal(scopeId, 'terminal:command', { ...event, scopeId }),
     })
     registerIpcHandlers({
-      appOrigin,
+      appOrigin: (sender) => (sender ? originForContents(sender) : appOrigin()),
       allowHttpLocalhost,
       accountDataAvailable,
       isLocalPageUrl,
@@ -931,9 +1092,11 @@ function main(): void {
           return setBrowserAgentPanelOccluded(occluded, win, resolvedScopeId, force)
         },
       },
-      beginOAuthConnect: (providerId, scope) => connectFlow.beginConnectHandoff(providerId, scope),
-      prepareSourceConnect: () => handoff.prepareSourceConnect(),
-      cancelSourceConnect: (requestId) => handoff.cancelSourceConnect(requestId),
+      beginOAuthConnect: (sender, providerId, scope) =>
+        runtimeForContents(sender).connectFlow.beginConnectHandoff(providerId, scope),
+      prepareSourceConnect: (sender) => runtimeForContents(sender).handoff.prepareSourceConnect(),
+      cancelSourceConnect: (sender, requestId) =>
+        runtimeForContents(sender).handoff.cancelSourceConnect(requestId),
       updates: {
         getState: () => updater?.getState() ?? { status: 'idle' },
         check: () => updater?.check(),
@@ -948,14 +1111,18 @@ function main(): void {
     })
     if (accountDataAvailable()) {
       // A sign-in, or a session rotation, binds the device to the new session.
-      ensureAppSession().cookies.on('changed', (_event, cookie, _cause, removed) => {
+      primaryRuntime().session.cookies.on('changed', (_event, cookie, _cause, removed) => {
         if (!removed && isSessionCookieName(cookie.name)) desktopExecutor.refreshRegistration()
       })
       desktopExecutor.start()
     }
+    // Every account gets a window: the primary where it was, the rest cascaded.
     await ensureMainWindow()
-    // Rebuilt after a shell choice so the radio reflects it; Electron menus
-    // are immutable once built.
+    for (const account of accounts().slice(1)) {
+      void createAndLoadAppWindow({ account })
+    }
+    // Rebuilt after a shell or account change so the radios reflect it;
+    // Electron menus are immutable once built.
     const installMenu = () =>
       installApplicationMenu({
         config,
@@ -964,8 +1131,18 @@ function main(): void {
         allowHttpLocalhost,
         openSettings,
         openServerSettings: () => serverWindow.open(),
-        newWindow: () => void createAndLoadAppWindow(),
-        newChat: () => void openMainWindowAt(newChatRoute(config.get('lastRoute'))),
+        newWindow: () => void createAndLoadAppWindow({ account: activeAccount() }),
+        newChat: () => {
+          const account = activeAccount()
+          void openMainWindowAt(newChatRoute(lastRouteFor(account)), account)
+        },
+        accounts: {
+          list: accounts,
+          active: activeAccount,
+          focus: (account) => void openMainWindowAt(undefined, account),
+          add: () => serverWindow.open('add-account'),
+          remove: (account) => void removeAccount(account),
+        },
         handleFocusedResourceShortcut: (win, shortcut) =>
           handleFocusedBrowserShortcut(shortcut, win) ||
           terminal.handleFocusedShortcut(win, shortcut),
@@ -986,6 +1163,7 @@ function main(): void {
           },
         },
       })
+    rebuildMenu = installMenu
     installMenu()
     installDocumentationHelpSearch()
     setTrayEnabled(config.get('trayEnabled') ?? true)
@@ -1004,7 +1182,7 @@ function main(): void {
             'Account-data recovery could not be persisted before update installation.'
           )
         }
-        if (sessionLifecycle && !(await sessionLifecycle.awaitTeardown())) {
+        if (!(await awaitAllTeardowns())) {
           throw new Error('Account teardown did not finish safely before update installation.')
         }
       },

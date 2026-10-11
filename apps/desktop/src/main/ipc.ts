@@ -327,7 +327,12 @@ export function parseDesktopNotificationPayload(raw: unknown): DesktopNotificati
 }
 
 export interface IpcDeps {
-  appOrigin: () => string
+  /**
+   * The Sim origin a renderer belongs to. Windows of different accounts can
+   * point at different servers, so the gate asks per sender; without one it
+   * answers for the active account.
+   */
+  appOrigin: (sender?: WebContents) => string
   allowHttpLocalhost: () => boolean
   /** False while local account-data persistence is unavailable or teardown must be retried. */
   accountDataAvailable: () => boolean
@@ -362,9 +367,14 @@ export interface IpcDeps {
       force?: boolean
     ) => boolean
   }
-  beginOAuthConnect: (providerId: string, scope: OAuthConnectScope) => Promise<boolean>
-  prepareSourceConnect: () => string
-  cancelSourceConnect: (requestId: string) => boolean
+  /** Handoffs run per account, so each takes the renderer that asked. */
+  beginOAuthConnect: (
+    sender: WebContents,
+    providerId: string,
+    scope: OAuthConnectScope
+  ) => Promise<boolean>
+  prepareSourceConnect: (sender: WebContents) => string
+  cancelSourceConnect: (sender: WebContents, requestId: string) => boolean
   updates: {
     getState: () => DesktopUpdateState
     check: () => void
@@ -523,7 +533,7 @@ async function fetchDesktopToolAuthorization(
   const startedAt = Date.now()
   try {
     const response = await event.sender.session.fetch(
-      `${deps.appOrigin()}/api/desktop/tool/authorize`,
+      `${deps.appOrigin(event.sender)}/api/desktop/tool/authorize`,
       {
         method: 'POST',
         credentials: 'include',
@@ -712,10 +722,11 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     'desktop:oauth-connect': {
       kind: 'invoke',
       gate: 'app-origin',
+      passSender: true,
       requiresAccountData: true,
       needsUserActivation: true,
       denied: false,
-      handler: (providerId, scope) => {
+      handler: (sender, providerId, scope) => {
         if (typeof providerId !== 'string') {
           return false
         }
@@ -723,35 +734,38 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         if (parsedScope === undefined) {
           return false
         }
-        return deps.beginOAuthConnect(providerId, parsedScope)
+        return deps.beginOAuthConnect(sender as WebContents, providerId, parsedScope)
       },
     },
     'desktop:source-connect-prepare': {
       kind: 'invoke',
       gate: 'app-origin',
+      passSender: true,
       requiresAccountData: true,
       needsUserActivation: true,
       denied: null,
-      handler: () => deps.prepareSourceConnect(),
+      handler: (sender) => deps.prepareSourceConnect(sender as WebContents),
     },
     'desktop:source-connect': {
       kind: 'invoke',
       gate: 'app-origin',
+      passSender: true,
       requiresAccountData: true,
       denied: false,
-      handler: (requestId) =>
+      handler: (sender, requestId) =>
         typeof requestId === 'string' && /^[A-Za-z0-9_-]{32}$/.test(requestId)
-          ? deps.beginOAuthConnect('source', { sourceRequestId: requestId })
+          ? deps.beginOAuthConnect(sender as WebContents, 'source', { sourceRequestId: requestId })
           : false,
     },
     'desktop:source-connect-cancel': {
       kind: 'invoke',
       gate: 'app-origin',
+      passSender: true,
       requiresAccountData: true,
       denied: false,
-      handler: (requestId) =>
+      handler: (sender, requestId) =>
         typeof requestId === 'string' && /^[A-Za-z0-9_-]{32}$/.test(requestId)
-          ? deps.cancelSourceConnect(requestId)
+          ? deps.cancelSourceConnect(sender as WebContents, requestId)
           : false,
     },
     'desktop:local-files': {
@@ -1992,10 +2006,11 @@ export function registerIpcHandlers(deps: IpcDeps): void {
 
   const senderAllowed = (event: IpcMainEvent | IpcMainInvokeEvent, gate: ChannelGate): boolean => {
     if (gate === 'any') return true
-    if (gate === 'app-origin') return isAppOriginSender(event, deps.appOrigin())
+    if (gate === 'app-origin') return isAppOriginSender(event, deps.appOrigin(event.sender))
     if (gate === 'app-or-local-page') {
       return (
-        isAppOriginSender(event, deps.appOrigin()) || isLocalPageSender(event, deps.isLocalPageUrl)
+        isAppOriginSender(event, deps.appOrigin(event.sender)) ||
+        isLocalPageSender(event, deps.isLocalPageUrl)
       )
     }
     if (gate === 'browser-page') return isAgentWebContents(event.sender)

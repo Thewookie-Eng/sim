@@ -1,6 +1,7 @@
 import type { MenuItemConstructorOptions } from 'electron'
 import { app, BrowserWindow, Menu } from 'electron'
-import { type ConfigStore, isSimCloudOrigin } from '@/main/config'
+import { accountDisplayName, accountHost } from '@/main/accounts'
+import { type Account, type ConfigStore, isSimCloudOrigin, PRIMARY_ACCOUNT_ID } from '@/main/config'
 import { showShellDialog } from '@/main/dialogs'
 import { DOCS_URL, STATUS_URL } from '@/main/external-links'
 import { openExternalSafe } from '@/main/navigation'
@@ -36,6 +37,15 @@ export interface MenuDeps {
   signOut: () => void
   checkForUpdates: () => void
   openDiagnostics: () => void
+  /** The signed-in accounts and how to act on them; absent while there is only ever one. */
+  accounts?: {
+    list: () => Account[]
+    active: () => Account
+    /** Brings the account's window forward, opening one if it has none. */
+    focus: (account: Account) => void
+    add: () => void
+    remove: (account: Account) => void
+  }
   /**
    * Windows only: the shell new terminals launch. macOS has one answer
    * (`$SHELL`), so the submenu exists only where there is a choice to make.
@@ -50,6 +60,49 @@ export interface MenuDeps {
 const TERMINAL_SHELL_LABELS: Record<WindowsTerminalShell, string> = {
   powershell: 'PowerShell',
   'git-bash': 'Git Bash',
+}
+
+/**
+ * One row per account, the active one checked, plus the ways to change the
+ * set. Two accounts can carry the same label, so a duplicated name shows its
+ * host as well.
+ */
+function accountsSubmenu(deps: MenuDeps): MenuItemConstructorOptions[] {
+  const choice = deps.accounts
+  if (!choice) return []
+  const list = choice.list()
+  const active = choice.active()
+  const nameFor = (account: Account) => {
+    const name = accountDisplayName(account)
+    const duplicated = list.some(
+      (other) => other.id !== account.id && accountDisplayName(other) === name
+    )
+    return duplicated ? `${name} (${accountHost(account)})` : name
+  }
+  const removable = list.filter((account) => account.id !== PRIMARY_ACCOUNT_ID)
+  return [
+    {
+      label: 'Accounts',
+      submenu: [
+        ...list.map((account) => ({
+          label: nameFor(account),
+          type: 'radio' as const,
+          checked: account.id === active.id,
+          click: () => choice.focus(account),
+        })),
+        { type: 'separator' as const },
+        { label: 'Add Account…', click: choice.add },
+        {
+          label: 'Remove Account',
+          enabled: removable.length > 0,
+          submenu: removable.map((account) => ({
+            label: nameFor(account),
+            click: () => choice.remove(account),
+          })),
+        },
+      ],
+    },
+  ]
 }
 
 function terminalShellSubmenu(deps: MenuDeps): MenuItemConstructorOptions[] {
@@ -231,10 +284,17 @@ export function buildMenuTemplate(deps: MenuDeps): MenuItemConstructorOptions[] 
           },
         },
         { label: 'Settings…', accelerator: 'CmdOrCtrl+,', click: deps.openSettings },
+        ...accountsSubmenu(deps),
         { label: 'Server…', click: deps.openServerSettings },
         ...terminalShellSubmenu(deps),
         { label: 'Check for Updates…', click: deps.checkForUpdates },
-        { label: 'Sign Out', click: deps.signOut },
+        {
+          label:
+            deps.accounts && deps.accounts.list().length > 1
+              ? `Sign Out ${accountDisplayName(deps.accounts.active())}`
+              : 'Sign Out',
+          click: deps.signOut,
+        },
         { type: 'separator' },
         // The hide roles are macOS-only; elsewhere they render as blank rows.
         ...(process.platform === 'darwin'

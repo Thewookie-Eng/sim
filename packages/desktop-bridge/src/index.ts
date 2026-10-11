@@ -1048,6 +1048,13 @@ export interface DesktopServerConfiguration {
    * shell must not be pointed at them.
    */
   isSimCloud: boolean
+  /**
+   * What the picker is for. `server` (the default) repoints the primary
+   * account; `add-account` signs in to another server, or the same one again,
+   * alongside the accounts already open. Optional for installed shells that
+   * predate accounts.
+   */
+  purpose?: 'server' | 'add-account'
 }
 
 /** Outcome of a server change. On success the shell relaunches immediately. */
