@@ -204,6 +204,11 @@ export interface CreateMainWindowDeps {
    * `lastRoute` setting; windows of other accounts keep their own.
    */
   onRouteChange?: (route: string) => void
+  /**
+   * Appended to the page's title, so windows of different accounts can be
+   * told apart in the taskbar and window switcher. Null adds nothing.
+   */
+  titleSuffix?: () => string | null
   /** A committed process restart must not be cancelled by a renderer's beforeunload handler. */
   isCommittedRelaunchPending: () => boolean
   onFullScreenChange?: (isFullScreen: boolean) => void
@@ -301,10 +306,16 @@ export function createMainWindow(deps: CreateMainWindowDeps): BrowserWindow {
     }
     deps.onFullScreenChange?.(false)
   })
-  win.on('page-title-updated', (event) => {
+  win.on('page-title-updated', (event, title) => {
     if (platform === 'darwin' && win.isFullScreen()) {
       event.preventDefault()
       win.setTitle('')
+      return
+    }
+    const suffix = deps.titleSuffix?.()
+    if (suffix) {
+      event.preventDefault()
+      win.setTitle(`${title} — ${suffix}`)
     }
   })
 

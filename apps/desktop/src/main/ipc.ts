@@ -339,7 +339,10 @@ export interface IpcDeps {
   /** Whether a frame URL is one of the bundled pages allowed to control the shell. */
   isLocalPageUrl: (url: string) => boolean
   retryLoad: (sender: WebContents) => void
-  localFilesystem: LocalFilesystemService
+  /** Folder grants are given to one account's agent, so each renderer sees its account's. */
+  localFilesystemFor: (sender: WebContents) => LocalFilesystemService
+  /** Brings the sender's account's window to a route; what a notification click does. */
+  openRouteForSender: (sender: WebContents, route?: string) => void
   terminal: TerminalRegistry
   scopeEvents: Pick<
     ScopedEventRouter,
@@ -600,7 +603,7 @@ async function authorizeLocalFilesystemTool(
     true
   )
   return authorization
-    ? deps.localFilesystem.isAuthorizedClientToolRequest(request, authorization)
+    ? deps.localFilesystemFor(event.sender).isAuthorizedClientToolRequest(request, authorization)
     : false
 }
 
@@ -780,13 +783,14 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     'desktop:local-filesystem': {
       kind: 'invoke',
       gate: 'app-origin',
+      passSender: true,
       requiresAccountData: true,
       denied: {
         ok: false,
         code: 'ACCESS_DENIED',
         error: 'Local filesystem access is not allowed from this page.',
       },
-      handler: (request) => deps.localFilesystem.handle(request),
+      handler: (sender, request) => deps.localFilesystemFor(sender as WebContents).handle(request),
     },
     'desktop-executor:get-device': {
       kind: 'invoke',
@@ -880,10 +884,16 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     'desktop:settings:notify': {
       kind: 'invoke',
       gate: 'app-origin',
+      passSender: true,
       denied: false,
-      handler: (raw) => {
+      handler: (sender, raw) => {
         const payload = parseDesktopNotificationPayload(raw)
-        return payload ? deps.settings.notify(payload) : false
+        if (!payload) return false
+        // A click lands in the account that raised the notification, not
+        // whichever window happens to be in front.
+        return deps.settings.notify(payload, (route) =>
+          deps.openRouteForSender(sender as WebContents, route)
+        )
       },
     },
     'desktop:window-state:get': {

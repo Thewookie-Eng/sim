@@ -45,7 +45,8 @@ export interface DesktopSettingsService {
   setTerminalDefaultZoom(zoom: DesktopZoomPercent): DesktopPreferences
   selectTerminalProfile(profile: TerminalThemeProfile): DesktopPreferences
   chooseBrowserDownloadDirectory(): Promise<DesktopPreferences | null>
-  notify(payload: DesktopNotificationPayload): boolean
+  /** `openRoute` overrides where a click lands; the default is the active window. */
+  notify(payload: DesktopNotificationPayload, openRoute?: (route?: string) => void): boolean
   applySystemPreferences(): void
 }
 
@@ -197,7 +198,7 @@ export function createDesktopSettingsService(
       deps.config.flush()
       return read()
     },
-    notify(payload) {
+    notify(payload, openRoute = deps.openMainWindowAt) {
       const preferences = read()
       if (!preferences.notificationsEnabled || !Notification.isSupported()) {
         return false
@@ -213,9 +214,7 @@ export function createDesktopSettingsService(
         silent: !preferences.notificationSounds,
       })
       notification.on('click', () => {
-        deps.openMainWindowAt(
-          payload.route && isSafeInternalPath(payload.route) ? payload.route : undefined
-        )
+        openRoute(payload.route && isSafeInternalPath(payload.route) ? payload.route : undefined)
       })
       notification.show()
       return true

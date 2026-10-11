@@ -181,11 +181,27 @@ function main(): void {
       logger.warn('Could not flush encrypted task resource state', { phase })
     }
   }
-  const localFilesystem = new LocalFilesystemService({
-    grantStore: createEncryptedLocalFilesystemGrantStore(
-      join(userDataPath, 'local-filesystem-grants.json')
-    ),
-  })
+  /**
+   * Folder grants are capabilities handed to one account's agent, so each
+   * account keeps its own store. The primary keeps the file it always had.
+   */
+  const localFilesystems = new Map<string, LocalFilesystemService>()
+  const localFilesystemFor = (account: Account): LocalFilesystemService => {
+    const existing = localFilesystems.get(account.id)
+    if (existing) return existing
+    const file =
+      account.id === PRIMARY_ACCOUNT_ID
+        ? 'local-filesystem-grants.json'
+        : `local-filesystem-grants-${account.id}.json`
+    const service = new LocalFilesystemService({
+      grantStore: createEncryptedLocalFilesystemGrantStore(join(userDataPath, file)),
+    })
+    localFilesystems.set(account.id, service)
+    // Accounts added after launch missed the startup restore.
+    if (app.isReady() && accountDataAvailable()) void service.initialize()
+    return service
+  }
+  const localFilesystem = localFilesystemFor(primaryAccount())
   const scopeEvents = new ScopedEventRouter()
   if (process.platform === 'win32') {
     const storedShell = config.get('terminalShell')
@@ -429,7 +445,10 @@ function main(): void {
             },
           },
           { label: 'task resource state', clear: clearDesktopChatSessions },
-          { label: 'local filesystem grants', clear: () => localFilesystem.forgetAll() },
+          {
+            label: 'local filesystem grants',
+            clear: () => localFilesystemFor(account).forgetAll(),
+          },
         ]
         const outcomes = await Promise.allSettled(
           stores.map(({ clear }) => Promise.resolve().then(clear))
@@ -528,6 +547,7 @@ function main(): void {
       isPackaged: app.isPackaged,
       restorePosition,
       onRouteChange: (path) => setLastRoute(account, path),
+      titleSuffix: () => (accounts().length > 1 ? accountDisplayName(account) : null),
       isCommittedRelaunchPending: () => committedRelaunchPending,
       onFullScreenChange: (isFullScreen) => {
         if (!win.isDestroyed()) {
@@ -646,6 +666,8 @@ function main(): void {
     }
     for (const win of windowsFor(account)) win.destroy()
     runtimes.delete(account.id)
+    localFilesystems.get(account.id)?.close()
+    localFilesystems.delete(account.id)
     config.removeAccount(account.id)
     rebuildMenu()
   }
@@ -873,7 +895,7 @@ function main(): void {
     // now be released without leaving a cancelled quit in a degraded state.
     tray?.destroy()
     tray = null
-    localFilesystem.close()
+    for (const service of localFilesystems.values()) service.close()
     quiesceBrowserSessions()
     terminal.dispose()
     uninstallDocumentationHelpSearch()
@@ -909,7 +931,12 @@ function main(): void {
       }
       const stores = [
         { label: 'built-in browser sessions', clear: () => clearAgentBrowserProfile() },
-        { label: 'local filesystem grants', clear: () => localFilesystem.forgetAll() },
+        {
+          label: 'local filesystem grants',
+          clear: async () => {
+            await Promise.all(accounts().map((account) => localFilesystemFor(account).forgetAll()))
+          },
+        },
         {
           label: 'browser site history',
           clear: () => {
@@ -1012,7 +1039,7 @@ function main(): void {
       localFilesystem
     )
     if (accountDataAvailable()) {
-      await localFilesystem.initialize()
+      await Promise.all(accounts().map((account) => localFilesystemFor(account).initialize()))
     }
     terminal.setSink({
       data: (scopeId, terminalId, data) =>
@@ -1032,7 +1059,9 @@ function main(): void {
         const win = windowForContents(sender)
         if (win) loadHealthByWindow.get(win)?.retry()
       },
-      localFilesystem,
+      localFilesystemFor: (sender) => localFilesystemFor(accountForContents(sender)),
+      openRouteForSender: (sender, route) =>
+        void openMainWindowAt(route, accountForContents(sender)),
       terminal,
       settings: desktopSettings,
       getWindowState: (sender) => ({

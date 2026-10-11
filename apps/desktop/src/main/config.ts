@@ -323,7 +323,9 @@ export function createConfigStore(
   let rewroteOrigin = false
   let persistenceBlocked = false
   try {
-    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as unknown
+    // Windows editors (Notepad, PowerShell's utf8) prepend a BOM that JSON.parse
+    // rejects; a hand-edited file must not silently disable persistence.
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8').replace(/^﻿/, '')) as unknown
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       persistenceBlocked = true
     } else {

@@ -260,6 +260,7 @@ const _activeChooserEvent = {
 
 describe('registerIpcHandlers', () => {
   let deps: IpcDeps
+  let localFilesystem: LocalFilesystemService
 
   beforeEach(() => {
     // Frozen so the input-recency windows cannot lapse mid-test: the gates read
@@ -287,6 +288,7 @@ describe('registerIpcHandlers', () => {
     mockCoordinator.showChooser.mockClear()
     mockCoordinator.listFillOptions.mockClear()
     mockCoordinator.fillCredential.mockClear()
+    localFilesystem = new LocalFilesystemService({ chooseDirectory: vi.fn(async () => null) })
     deps = {
       appOrigin: () => APP,
       getExecutorDevice: () => null,
@@ -297,9 +299,8 @@ describe('registerIpcHandlers', () => {
       beginOAuthConnect: vi.fn(async () => true),
       prepareSourceConnect: vi.fn(() => 's'.repeat(32)),
       cancelSourceConnect: vi.fn(() => true),
-      localFilesystem: new LocalFilesystemService({
-        chooseDirectory: vi.fn(async () => null),
-      }),
+      localFilesystemFor: () => localFilesystem,
+      openRouteForSender: vi.fn(),
       terminal: new TerminalRegistry(),
       scopeEvents: {
         activateBrowser: vi.fn(),
@@ -424,7 +425,7 @@ describe('registerIpcHandlers', () => {
   it('gates account-bearing browser, terminal, and filesystem APIs during recovery', async () => {
     deps.accountDataAvailable = () => false
     const { invoke } = collectHandlers()
-    const localFilesystemHandle = vi.spyOn(deps.localFilesystem, 'handle')
+    const localFilesystemHandle = vi.spyOn(localFilesystem, 'handle')
     const terminalRestore = vi.spyOn(deps.terminal, 'restoreScope')
 
     await expect(
@@ -474,7 +475,7 @@ describe('registerIpcHandlers', () => {
       senderFrame: { url: `${APP}/o/org/home` },
       sender: { session: { fetch: fetchAuthorization } },
     }
-    const mounts = vi.spyOn(deps.localFilesystem, 'handle')
+    const mounts = vi.spyOn(localFilesystem, 'handle')
     expect(
       await handler?.(authorizedEvent, {
         operation: 'read',
@@ -531,7 +532,7 @@ describe('registerIpcHandlers', () => {
   it('requires server authorization for every privileged filesystem tool request', async () => {
     const { invoke } = collectHandlers()
     const handler = invoke.get('desktop:local-filesystem')
-    const handle = vi.spyOn(deps.localFilesystem, 'handle')
+    const handle = vi.spyOn(localFilesystem, 'handle')
 
     expect(
       await handler?.(appEvent, {
@@ -557,7 +558,7 @@ describe('registerIpcHandlers', () => {
       senderFrame: { url: `${APP}/workspace/ws1` },
       sender: { session: { fetch: fetchAuthorization } },
     }
-    vi.spyOn(deps.localFilesystem, 'isAuthorizedClientToolRequest').mockReturnValueOnce(true)
+    vi.spyOn(localFilesystem, 'isAuthorizedClientToolRequest').mockReturnValueOnce(true)
     handle.mockResolvedValueOnce({ ok: true, data: { forgotten: false } })
 
     await expect(
