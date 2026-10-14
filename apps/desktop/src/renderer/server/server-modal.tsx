@@ -88,7 +88,7 @@ export function ServerModal({ server, configuration, initialError }: ServerModal
       <ChipModalBody>
         <ChipModalDescription id='server-description'>
           {renaming
-            ? 'The name shown in the Accounts menu and window titles. Leave it blank to use the signed-in user’s name.'
+            ? 'The name shown in the Accounts menu and window titles. Leave it blank to use the signed-in email.'
             : addingAccount
               ? 'Sign in to another account in its own window. Enter the server it lives on — the same one again, or a self-hosted deployment.'
               : 'Point this app at your own Sim deployment. Self-hosted servers must use HTTPS; localhost may use HTTP.'}

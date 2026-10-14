@@ -39,19 +39,21 @@ export function accountHost(account: Account): string {
 
 /**
  * What menus and window titles call an account: the user's own name for it,
- * else who it is signed in as, else only the server.
+ * else the signed-in email, else only the server. The email, not the display
+ * name: two logins belonging to one person carry the same name, and the
+ * whole point of the label is to tell them apart.
  */
 export function accountDisplayName(account: Account, identity?: AccountIdentity | null): string {
   const label = account.label?.trim()
   if (label) return label
-  const name = identity?.name?.trim()
-  if (name) return name
   const email = identity?.email?.trim()
   if (email) return email
+  const name = identity?.name?.trim()
+  if (name) return name
   return accountHost(account)
 }
 
-/** `Ada (sim.ai)`; just `sim.ai` while nobody is signed in and it has no name. */
+/** `ada@example.com (sim.ai)`; just `sim.ai` while nobody is signed in and it has no name. */
 export function accountMenuLabel(account: Account, identity?: AccountIdentity | null): string {
   const name = accountDisplayName(account, identity)
   const host = accountHost(account)
