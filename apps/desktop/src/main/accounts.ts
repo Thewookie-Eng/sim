@@ -11,6 +11,13 @@
  */
 import { type Account, PRIMARY_ACCOUNT_ID, partitionForOrigin } from '@/main/config'
 
+/** Who the account's jar is signed in as, read from the server's session. */
+export interface AccountIdentity {
+  userId: string
+  name: string | null
+  email: string | null
+}
+
 /**
  * The cookie/storage partition an account lives in. The primary account keeps
  * the per-origin partition it always had; every other account gets a jar keyed
@@ -21,17 +28,32 @@ export function partitionForAccount(account: Account): string {
   return `persist:sim-account-${encodeURIComponent(account.id)}`
 }
 
-/** The host alone; what disambiguates two accounts that share a label. */
+/** The server, as people say it: `sim.ai`, not `www.sim.ai`. */
 export function accountHost(account: Account): string {
   try {
-    return new URL(account.origin).host
+    return new URL(account.origin).host.replace(/^www\./, '')
   } catch {
     return account.origin
   }
 }
 
-/** What menus and window titles call an account. */
-export function accountDisplayName(account: Account): string {
+/**
+ * What menus and window titles call an account: the user's own name for it,
+ * else who it is signed in as, else only the server.
+ */
+export function accountDisplayName(account: Account, identity?: AccountIdentity | null): string {
   const label = account.label?.trim()
-  return label || accountHost(account)
+  if (label) return label
+  const name = identity?.name?.trim()
+  if (name) return name
+  const email = identity?.email?.trim()
+  if (email) return email
+  return accountHost(account)
+}
+
+/** `Ada (sim.ai)`; just `sim.ai` while nobody is signed in and it has no name. */
+export function accountMenuLabel(account: Account, identity?: AccountIdentity | null): string {
+  const name = accountDisplayName(account, identity)
+  const host = accountHost(account)
+  return name === host ? host : `${name} (${host})`
 }

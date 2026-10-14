@@ -122,6 +122,8 @@ export interface DesktopSettings {
   origin: string
   /** Accounts beyond the primary one; see {@link Account}. */
   additionalAccounts?: Account[]
+  /** A user-chosen name for the primary account, which has no entry of its own. */
+  primaryAccountLabel?: string
   /** The last in-app route each non-primary account's window showed, by account id. */
   accountRoutes?: Record<string, string>
   windowBounds?: WindowBounds
@@ -286,6 +288,8 @@ export interface ConfigStore {
   addAccount(origin: string, label?: string): AccountValidation
   /** Removes a non-primary account; false when it is the primary or unknown. */
   removeAccount(id: string): boolean
+  /** Sets or, with an empty label, clears an account's user-chosen name. */
+  renameAccount(id: string, label: string): boolean
   get<K extends keyof DesktopSettings>(key: K): DesktopSettings[K]
   set<K extends keyof DesktopSettings>(key: K, value: DesktopSettings[K]): void
   /** Writes any debounced change immediately and reports whether persistence is healthy. */
@@ -454,7 +458,31 @@ export function createConfigStore(
     },
     getAccounts() {
       const additional = (settings.additionalAccounts ?? []).filter(isAccount)
-      return [{ id: PRIMARY_ACCOUNT_ID, origin: currentOrigin() }, ...additional]
+      const primaryLabel = settings.primaryAccountLabel?.trim()
+      const primary: Account = {
+        id: PRIMARY_ACCOUNT_ID,
+        origin: currentOrigin(),
+        ...(primaryLabel ? { label: primaryLabel } : {}),
+      }
+      return [primary, ...additional]
+    },
+    renameAccount(id, label) {
+      const trimmed = label.trim()
+      if (id === PRIMARY_ACCOUNT_ID) {
+        this.set('primaryAccountLabel', trimmed || undefined)
+        return true
+      }
+      const current = (settings.additionalAccounts ?? []).filter(isAccount)
+      if (!current.some((account) => account.id === id)) return false
+      this.set(
+        'additionalAccounts',
+        current.map((account) => {
+          if (account.id !== id) return account
+          const { label: _previous, ...rest } = account
+          return trimmed ? { ...rest, label: trimmed } : rest
+        })
+      )
+      return true
     },
     addAccount(raw, label) {
       const validated = validateOriginInput(raw)

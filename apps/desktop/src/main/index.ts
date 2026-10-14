@@ -23,7 +23,7 @@ import {
   retryAccountDataTeardown,
   waitForAccountDataMutations,
 } from '@/main/account-data-generation'
-import { accountDisplayName, partitionForAccount } from '@/main/accounts'
+import { type AccountIdentity, accountDisplayName, partitionForAccount } from '@/main/accounts'
 import { newChatRoute, settingsRoute } from '@/main/app-routes'
 import {
   activateBrowserScope as activateAgentBrowserScope,
@@ -95,6 +95,7 @@ import {
   decideStartRoute,
   handleConnectIntercept,
   isSessionCookieName,
+  readSessionIdentity,
   readSessionUserId,
   resolveStartRoute,
 } from '@/main/session-lifecycle'
@@ -350,10 +351,24 @@ function main(): void {
     authFlow: ReturnType<typeof createAuthFlow>
     connectFlow: ReturnType<typeof createConnectFlow>
     lifecycle: ReturnType<typeof createSessionLifecycleCoordinator>
+    /** Who the jar is signed in as; null until read, or while signed out. */
+    identity: AccountIdentity | null
   }
   const runtimes = new Map<string, AccountRuntime>()
   const runtimeForContents = (contents: WebContents) => ensureRuntime(accountForContents(contents))
   const primaryRuntime = () => ensureRuntime(primaryAccount())
+  const identityFor = (account: Account) => runtimes.get(account.id)?.identity ?? null
+  /** The window-title suffix that tells accounts apart; nothing with one account. */
+  const titleSuffixFor = (account: Account) =>
+    accounts().length > 1 ? accountDisplayName(account, identityFor(account)) : null
+  /** Re-applies the suffix now, instead of waiting for the page's next title change. */
+  const retitleWindows = (account: Account) => {
+    const suffix = titleSuffixFor(account)
+    for (const win of windowsFor(account)) {
+      const title = win.webContents.getTitle()
+      win.setTitle(suffix ? `${title} — ${suffix}` : title)
+    }
+  }
 
   function ensureRuntime(account: Account): AccountRuntime {
     const existing = runtimes.get(account.id)
@@ -488,8 +503,25 @@ function main(): void {
       authFlow,
       connectFlow,
       lifecycle,
+      identity: null,
     }
     runtimes.set(account.id, runtime)
+
+    // The menu names each account after the user it is signed in as, so the
+    // identity is read now and again whenever the session cookie changes.
+    const refreshIdentity = () => {
+      void readSessionIdentity(ses, account.origin).then((identity) => {
+        if (runtimes.get(account.id) !== runtime) return
+        if (JSON.stringify(runtime.identity) === JSON.stringify(identity)) return
+        runtime.identity = identity
+        rebuildMenu()
+        retitleWindows(account)
+      })
+    }
+    refreshIdentity()
+    ses.cookies.on('changed', (_event, cookie) => {
+      if (isSessionCookieName(cookie.name)) refreshIdentity()
+    })
     return runtime
   }
 
@@ -547,7 +579,7 @@ function main(): void {
       isPackaged: app.isPackaged,
       restorePosition,
       onRouteChange: (path) => setLastRoute(account, path),
-      titleSuffix: () => (accounts().length > 1 ? accountDisplayName(account) : null),
+      titleSuffix: () => titleSuffixFor(account),
       isCommittedRelaunchPending: () => committedRelaunchPending,
       onFullScreenChange: (isFullScreen) => {
         if (!win.isDestroyed()) {
@@ -794,6 +826,13 @@ function main(): void {
     isPackaged: app.isPackaged,
     getParentWindow: getMainWindow,
     addAccount,
+    renameAccount: (accountId, label) => {
+      if (!config.renameAccount(accountId, label)) return false
+      rebuildMenu()
+      const account = accountById(accountId)
+      if (account) retitleWindows(account)
+      return true
+    },
     prepareDeploymentScopedStateChange: () =>
       beginAccountDataTeardown('deployment', primaryAccount().origin),
     clearDeploymentScopedState: async () => {
@@ -1168,8 +1207,14 @@ function main(): void {
         accounts: {
           list: accounts,
           active: activeAccount,
+          identity: identityFor,
           focus: (account) => void openMainWindowAt(undefined, account),
           add: () => serverWindow.open('add-account'),
+          rename: (account) =>
+            serverWindow.open('rename-account', {
+              accountId: account.id,
+              label: account.label ?? '',
+            }),
           remove: (account) => void removeAccount(account),
         },
         handleFocusedResourceShortcut: (win, shortcut) =>

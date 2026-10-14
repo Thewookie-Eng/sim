@@ -27,8 +27,11 @@ function mountServerModal(element: HTMLDivElement | null) {
 
 export function ServerModal({ server, configuration, initialError }: ServerModalProps) {
   const addingAccount = configuration?.purpose === 'add-account'
+  const renaming = configuration?.purpose === 'rename-account'
   const requestInFlight = useRef(false)
-  const [origin, setOrigin] = useState(configuration?.origin ?? '')
+  const [origin, setOrigin] = useState(
+    renaming ? (configuration?.label ?? '') : (configuration?.origin ?? '')
+  )
   const [pending, setPending] = useState(false)
   const [error, setError] = useState(initialError)
   const [message, setMessage] = useState(
@@ -38,7 +41,8 @@ export function ServerModal({ server, configuration, initialError }: ServerModal
   )
 
   async function connect() {
-    if (requestInFlight.current || !origin.trim()) return
+    // A blank name is a valid rename: it goes back to the signed-in user's name.
+    if (requestInFlight.current || (!renaming && !origin.trim())) return
     requestInFlight.current = true
     setPending(true)
     setError(undefined)
@@ -52,7 +56,11 @@ export function ServerModal({ server, configuration, initialError }: ServerModal
       }
     } catch {
       setError(
-        addingAccount ? 'The account could not be added.' : 'The server could not be changed.'
+        renaming
+          ? 'The account could not be renamed.'
+          : addingAccount
+            ? 'The account could not be added.'
+            : 'The server could not be changed.'
       )
     } finally {
       requestInFlight.current = false
@@ -73,18 +81,22 @@ export function ServerModal({ server, configuration, initialError }: ServerModal
         onClose={closeWindow}
         className='[-webkit-app-region:drag] [&_button]:[-webkit-app-region:no-drag]'
       >
-        <span id='server-title'>{addingAccount ? 'Add account' : 'Sim server'}</span>
+        <span id='server-title'>
+          {renaming ? 'Rename account' : addingAccount ? 'Add account' : 'Sim server'}
+        </span>
       </ChipModalHeader>
       <ChipModalBody>
         <ChipModalDescription id='server-description'>
-          {addingAccount
-            ? 'Sign in to another account in its own window. Enter the server it lives on — the same one again, or a self-hosted deployment.'
-            : 'Point this app at your own Sim deployment. Self-hosted servers must use HTTPS; localhost may use HTTP.'}
+          {renaming
+            ? 'The name shown in the Accounts menu and window titles. Leave it blank to use the signed-in user’s name.'
+            : addingAccount
+              ? 'Sign in to another account in its own window. Enter the server it lives on — the same one again, or a self-hosted deployment.'
+              : 'Point this app at your own Sim deployment. Self-hosted servers must use HTTPS; localhost may use HTTP.'}
         </ChipModalDescription>
         <ChipModalField
           type='input'
-          inputType='url'
-          title='Server URL'
+          inputType={renaming ? 'text' : 'url'}
+          title={renaming ? 'Name' : 'Server URL'}
           value={origin}
           onChange={(value) => {
             setOrigin(value)
@@ -92,18 +104,20 @@ export function ServerModal({ server, configuration, initialError }: ServerModal
             setMessage('')
           }}
           autoComplete='off'
-          placeholder='https://sim.example.com'
+          placeholder={renaming ? 'Work' : 'https://sim.example.com'}
           disabled={pending}
           error={error}
-          hint={<span role='status'>{pending ? 'Connecting…' : message}</span>}
+          hint={
+            <span role='status'>{pending ? (renaming ? 'Saving…' : 'Connecting…') : message}</span>
+          }
         />
       </ChipModalBody>
       <ChipModalFooter
         onCancel={closeWindow}
         primaryAction={{
-          label: pending ? 'Connecting…' : 'Connect',
+          label: renaming ? (pending ? 'Saving…' : 'Save') : pending ? 'Connecting…' : 'Connect',
           onClick: connect,
-          disabled: pending || !origin.trim(),
+          disabled: pending || (!renaming && !origin.trim()),
         }}
       />
     </ChipModalSurface>

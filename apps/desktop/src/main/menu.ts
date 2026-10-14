@@ -1,6 +1,6 @@
 import type { MenuItemConstructorOptions } from 'electron'
 import { app, BrowserWindow, Menu } from 'electron'
-import { accountDisplayName, accountHost } from '@/main/accounts'
+import { type AccountIdentity, accountMenuLabel } from '@/main/accounts'
 import { type Account, type ConfigStore, isSimCloudOrigin, PRIMARY_ACCOUNT_ID } from '@/main/config'
 import { showShellDialog } from '@/main/dialogs'
 import { DOCS_URL, STATUS_URL } from '@/main/external-links'
@@ -41,9 +41,12 @@ export interface MenuDeps {
   accounts?: {
     list: () => Account[]
     active: () => Account
+    /** Who the account is signed in as, when the shell has found out. */
+    identity: (account: Account) => AccountIdentity | null
     /** Brings the account's window forward, opening one if it has none. */
     focus: (account: Account) => void
     add: () => void
+    rename: (account: Account) => void
     remove: (account: Account) => void
   }
   /**
@@ -63,22 +66,15 @@ const TERMINAL_SHELL_LABELS: Record<WindowsTerminalShell, string> = {
 }
 
 /**
- * One row per account, the active one checked, plus the ways to change the
- * set. Two accounts can carry the same label, so a duplicated name shows its
- * host as well.
+ * One row per account — `Ada (sim.ai)`, the active one checked — plus the
+ * ways to change the set.
  */
 function accountsSubmenu(deps: MenuDeps): MenuItemConstructorOptions[] {
   const choice = deps.accounts
   if (!choice) return []
   const list = choice.list()
   const active = choice.active()
-  const nameFor = (account: Account) => {
-    const name = accountDisplayName(account)
-    const duplicated = list.some(
-      (other) => other.id !== account.id && accountDisplayName(other) === name
-    )
-    return duplicated ? `${name} (${accountHost(account)})` : name
-  }
+  const nameFor = (account: Account) => accountMenuLabel(account, choice.identity(account))
   const removable = list.filter((account) => account.id !== PRIMARY_ACCOUNT_ID)
   return [
     {
@@ -92,6 +88,13 @@ function accountsSubmenu(deps: MenuDeps): MenuItemConstructorOptions[] {
         })),
         { type: 'separator' as const },
         { label: 'Add Account…', click: choice.add },
+        {
+          label: 'Rename Account',
+          submenu: list.map((account) => ({
+            label: nameFor(account),
+            click: () => choice.rename(account),
+          })),
+        },
         {
           label: 'Remove Account',
           enabled: removable.length > 0,
@@ -291,7 +294,7 @@ export function buildMenuTemplate(deps: MenuDeps): MenuItemConstructorOptions[] 
         {
           label:
             deps.accounts && deps.accounts.list().length > 1
-              ? `Sign Out ${accountDisplayName(deps.accounts.active())}`
+              ? `Sign Out ${accountMenuLabel(deps.accounts.active(), deps.accounts.identity(deps.accounts.active()))}`
               : 'Sign Out',
           click: deps.signOut,
         },

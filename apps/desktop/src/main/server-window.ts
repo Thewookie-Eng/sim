@@ -89,12 +89,20 @@ export interface ServerWindowDeps {
    * no teardown and no relaunch, since nothing existing moves.
    */
   addAccount: (origin: string) => Promise<DesktopServerChangeResult>
+  /** Sets an account's user-chosen name; an empty name clears it. */
+  renameAccount: (accountId: string, label: string) => boolean
 }
 
 export type ServerWindowPurpose = NonNullable<DesktopServerConfiguration['purpose']>
 
+/** The account a `rename-account` window edits. */
+export interface ServerWindowTarget {
+  accountId: string
+  label: string
+}
+
 export interface ServerWindowHandle {
-  open(purpose?: ServerWindowPurpose): void
+  open(purpose?: ServerWindowPurpose, target?: ServerWindowTarget): void
   getConfiguration(): DesktopServerConfiguration
   setOrigin(origin: string): Promise<DesktopServerChangeResult>
 }
@@ -113,8 +121,9 @@ export function createServerWindow(deps: ServerWindowDeps): ServerWindowHandle {
   let win: BrowserWindow | null = null
   /** Prevents concurrent IPC requests from interleaving server teardown and persistence. */
   let changeInFlight = false
-  /** What the open window does with the URL it is given. */
+  /** What the open window does with the value it is given. */
   let purpose: ServerWindowPurpose = 'server'
+  let target: ServerWindowTarget | null = null
 
   const getConfiguration = (): DesktopServerConfiguration => {
     // Adding an account starts from this build's default server: most second
@@ -125,6 +134,7 @@ export function createServerWindow(deps: ServerWindowDeps): ServerWindowHandle {
       defaultOrigin: deps.defaultOrigin,
       isSimCloud: isSimCloudOrigin(origin),
       purpose,
+      ...(purpose === 'rename-account' ? { label: target?.label ?? '' } : {}),
     }
   }
 
@@ -135,11 +145,14 @@ export function createServerWindow(deps: ServerWindowDeps): ServerWindowHandle {
     win = null
   }
 
-  const open = (requestedPurpose: ServerWindowPurpose = 'server'): void => {
+  const open = (
+    requestedPurpose: ServerWindowPurpose = 'server',
+    requestedTarget: ServerWindowTarget | null = null
+  ): void => {
     if (win && !win.isDestroyed()) {
-      // A window already open for the other purpose shows the other copy;
-      // close it so the page reloads with the right one.
-      if (purpose !== requestedPurpose) {
+      // A window already open for another purpose or account shows the other
+      // copy; close it so the page reloads with the right one.
+      if (purpose !== requestedPurpose || target?.accountId !== requestedTarget?.accountId) {
         close()
       } else {
         win.show()
@@ -148,6 +161,7 @@ export function createServerWindow(deps: ServerWindowDeps): ServerWindowHandle {
       }
     }
     purpose = requestedPurpose
+    target = requestedTarget
     const parent = deps.getParentWindow()
     // Every other session in the app installs a permission handler; without one
     // Electron decides for itself what a page may ask the OS for. The page here
@@ -241,6 +255,17 @@ export function createServerWindow(deps: ServerWindowDeps): ServerWindowHandle {
   }
 
   const setOrigin = async (raw: string): Promise<DesktopServerChangeResult> => {
+    if (purpose === 'rename-account') {
+      if (!target) return { ok: false, error: 'No account is being renamed.' }
+      if (raw.trim().length > 64) {
+        return { ok: false, error: 'Keep the name under 64 characters.' }
+      }
+      if (!deps.renameAccount(target.accountId, raw)) {
+        return { ok: false, error: 'That account no longer exists.' }
+      }
+      close()
+      return { ok: true, origin: deps.config.getOrigin(), unchanged: false }
+    }
     const validated = validateOriginInput(raw)
     if (!validated.ok) {
       return validated

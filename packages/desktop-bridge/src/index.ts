@@ -1051,10 +1051,12 @@ export interface DesktopServerConfiguration {
   /**
    * What the picker is for. `server` (the default) repoints the primary
    * account; `add-account` signs in to another server, or the same one again,
-   * alongside the accounts already open. Optional for installed shells that
-   * predate accounts.
+   * alongside the accounts already open; `rename-account` edits an account's
+   * name. Optional for installed shells that predate accounts.
    */
-  purpose?: 'server' | 'add-account'
+  purpose?: 'server' | 'add-account' | 'rename-account'
+  /** For `rename-account`: the account's current user-chosen name, if any. */
+  label?: string
 }
 
 /** Outcome of a server change. On success the shell relaunches immediately. */

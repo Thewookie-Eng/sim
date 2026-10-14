@@ -1,4 +1,5 @@
 import { createLogger } from '@sim/logger'
+import { toStringOrNull } from '@sim/utils/coerce'
 import { sleep } from '@sim/utils/helpers'
 import type { Session, WebContents } from 'electron'
 import { BrowserWindow } from 'electron'
@@ -7,6 +8,7 @@ import {
   completeAccountDataTeardown,
   waitForAccountDataMutations,
 } from '@/main/account-data-generation'
+import type { AccountIdentity } from '@/main/accounts'
 import { APP_ENTRY_ROUTE } from '@/main/app-routes'
 import { isSafeInternalPath } from '@/main/config'
 import { showShellDialog } from '@/main/dialogs'
@@ -175,6 +177,19 @@ export async function readSessionUserId(
   origin: string,
   timeoutMs: number = SESSION_PROBE_TIMEOUT_MS
 ): Promise<string | null> {
+  const identity = await readSessionIdentity(session, origin, timeoutMs)
+  return identity?.userId ?? null
+}
+
+/**
+ * Who the partition is signed in as — id plus the name and email the Accounts
+ * menu shows — or null when signed out or unreachable.
+ */
+export async function readSessionIdentity(
+  session: Session,
+  origin: string,
+  timeoutMs: number = SESSION_PROBE_TIMEOUT_MS
+): Promise<AccountIdentity | null> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
@@ -187,9 +202,15 @@ export async function readSessionUserId(
       return null
     }
     const data = (await response.json().catch(() => null)) as {
-      user?: { id?: unknown }
+      user?: { id?: unknown; name?: unknown; email?: unknown }
     } | null
-    return typeof data?.user?.id === 'string' ? data.user.id : null
+    const userId = toStringOrNull(data?.user?.id)
+    if (!userId) return null
+    return {
+      userId,
+      name: toStringOrNull(data?.user?.name),
+      email: toStringOrNull(data?.user?.email),
+    }
   } catch {
     return null
   } finally {
