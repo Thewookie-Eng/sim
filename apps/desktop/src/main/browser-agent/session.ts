@@ -79,6 +79,11 @@ import {
 import { clearHostVerdictCache } from '@/main/browser-agent/url-guard'
 import type { BrowserSessionSnapshot } from '@/main/desktop-chat-session-store'
 import { suggestedFilename, uniqueDownloadPath } from '@/main/downloads'
+import {
+  checkLocalNetworkAccess,
+  isLocalNetworkPermission,
+  requestLocalNetworkAccess,
+} from '@/main/local-network-access'
 import { isAppOrigin } from '@/main/navigation'
 import {
   type FocusedResourceShortcut,
@@ -1580,9 +1585,17 @@ const browserPermissions: BrowserPermissionHandlers = {
       withBrowserScope(scoped.scopeId, () => publishPageIssue(scoped.tab))
       return
     }
+    if (isLocalNetworkPermission(permission)) {
+      const requestingUrl = (details as { requestingUrl?: string }).requestingUrl
+      void requestLocalNetworkAccess(requestingUrl || contents.getURL(), contents).then(callback)
+      return
+    }
     callback(ALLOWED_SITE_PERMISSIONS.has(permission))
   },
   check: (contents, permission, requestingOrigin, details) => {
+    if (isLocalNetworkPermission(permission)) {
+      return checkLocalNetworkAccess(requestingOrigin || details.requestingUrl, contents)
+    }
     if (permission === 'media') {
       if (!contents || details.isMainFrame !== true) return false
       const scoped = scopedTabForContents(contents)

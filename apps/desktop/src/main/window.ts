@@ -5,6 +5,11 @@ import { app, BrowserWindow, dialog, nativeTheme, screen, systemPreferences } fr
 import { agentPermissionHandlers } from '@/main/browser-agent/registry'
 import { type ConfigStore, isSafeInternalPath, type WindowBounds } from '@/main/config'
 import { showShellDialog } from '@/main/dialogs'
+import {
+  checkLocalNetworkAccess,
+  isLocalNetworkPermission,
+  requestLocalNetworkAccess,
+} from '@/main/local-network-access'
 import { isAppOrigin, isAuthSurfacePath } from '@/main/navigation'
 import type { EventRecorder } from '@/main/observability'
 import { attachShellTheme, backgroundColorFor, setShellTheme } from '@/main/shell-theme'
@@ -106,6 +111,10 @@ export function setupPermissionHandlers(session: Session, getAppOrigin: () => st
       return
     }
     const requestingUrl = details.requestingUrl || webContents?.getURL() || ''
+    if (isLocalNetworkPermission(permission)) {
+      void requestLocalNetworkAccess(requestingUrl, webContents).then(callback)
+      return
+    }
     const mediaTypes = 'mediaTypes' in details ? details.mediaTypes : undefined
     if (!resolvePermission(permission, originOf(requestingUrl), getAppOrigin(), mediaTypes)) {
       callback(false)
@@ -122,6 +131,9 @@ export function setupPermissionHandlers(session: Session, getAppOrigin: () => st
     const browserPermissions = agentPermissionHandlers(webContents)
     if (browserPermissions)
       return browserPermissions.check(webContents, permission, requestingOrigin, details)
+    if (isLocalNetworkPermission(permission)) {
+      return checkLocalNetworkAccess(requestingOrigin, webContents)
+    }
     const mediaTypes = details.mediaType ? [details.mediaType] : undefined
     return resolvePermission(permission, originOf(requestingOrigin), getAppOrigin(), mediaTypes)
   })

@@ -77,6 +77,7 @@ import { attachLoadHealth, type LoadHealthHandle } from '@/main/load-health'
 import { executeLocalFileRequest } from '@/main/local-files'
 import { LocalFilesystemService, mountVfsRoot } from '@/main/local-filesystem'
 import { createEncryptedLocalFilesystemGrantStore } from '@/main/local-filesystem-grant-store'
+import { initLocalNetworkAccess } from '@/main/local-network-access'
 import {
   attachLocalPageProtocol,
   isLocalPageUrl,
@@ -139,6 +140,7 @@ function main(): void {
 
   const userDataPath = app.getPath('userData')
   const config = createConfigStore(join(userDataPath, 'settings.json'))
+  initLocalNetworkAccess(config)
   setShellTheme(config.get('themeBackground'))
   initializeAccountDataRecovery(join(userDataPath, 'account-data-teardown-required.json'))
   const recoveryOrigin = getAccountDataTeardownOrigin()

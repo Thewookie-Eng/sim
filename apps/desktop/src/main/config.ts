@@ -154,6 +154,12 @@ export interface DesktopSettings {
   /** Windows only: which installed shell new terminals launch. */
   terminalShell?: WindowsTerminalShell
   /**
+   * Sites the user allowed to reach apps on this device (Chromium's Local
+   * Network Access), e.g. an Okta sign-in talking to Okta Verify. Remove an
+   * origin here to revoke it.
+   */
+  localNetworkAccessOrigins?: string[]
+  /**
    * Top-level sites visited in the dedicated agent-browser profile. This is
    * local inference metadata only; no cookies, credentials, or account data
    * are persisted here.
