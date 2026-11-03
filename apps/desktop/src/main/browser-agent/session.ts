@@ -2293,7 +2293,11 @@ function initializeTabView(
   scopeId: string,
   appOrigin?: string
 ): WebContentsView {
-  view.setBackgroundColor(browserBackgroundColor())
+  // Chromium paints this as the page canvas, so it must match a real
+  // browser's white default: pages that leave their root background unset
+  // (Slack's app settings) otherwise render grey text on black. Pages that
+  // declare `color-scheme: dark` still get Chromium's dark canvas.
+  view.setBackgroundColor(PAGE_CANVAS_COLOR)
   const contents = view.webContents
   registerAgentWebContents(contents, appOrigin, browserPermissions)
   if (appOrigin) configureBrowserDownloads(contents.session)
@@ -2689,26 +2693,18 @@ function browserBackgroundColor(): string {
   return dark ? '#0c0c0c' : '#ffffff'
 }
 
-function updateTabBackgrounds(): void {
-  const color = browserBackgroundColor()
-  for (const tab of tabs) {
-    if (!tab.view.webContents.isDestroyed()) {
-      tab.view.setBackgroundColor(color)
-    }
-  }
-}
+const PAGE_CANVAS_COLOR = '#ffffff'
 
 /**
  * Applies Sim's raw appearance preference to every current and future tab.
- * Page media-query emulation stays in the CDP layer; this module owns the
- * native view backdrop used before and between page paints.
+ * Page media-query emulation stays in the CDP layer; the native view canvas
+ * stays white like a real browser's.
  */
 export function setBrowserTheme(theme: BrowserTheme): void {
   if (browserTheme === theme) return
   browserTheme = theme
   for (const scopeId of browserScopeStates.keys()) {
     withBrowserScope(scopeId, () => {
-      updateTabBackgrounds()
       for (const tab of tabs) {
         if (!tab.view.webContents.isDestroyed()) {
           events?.onTabThemeChanged(tab.view.webContents, theme)
@@ -2751,14 +2747,6 @@ export function setBrowserDefaultZoom(zoom: DesktopZoomPercent): void {
 export function getBrowserTheme(): BrowserTheme {
   return browserTheme
 }
-
-nativeTheme.on('updated', () => {
-  if (browserTheme === 'system') {
-    for (const scopeId of browserScopeStates.keys()) {
-      withBrowserScope(scopeId, updateTabBackgrounds)
-    }
-  }
-})
 
 /** The active tab, creating the first tab when none exist. */
 export function ensureTab(): AgentTab {
