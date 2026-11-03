@@ -275,8 +275,6 @@ export interface DriverCallbacks {
 }
 
 let driverCallbacks: DriverCallbacks | null = null
-/** The app origin and authenticated session file transfers use; absent in headless tests. */
-let driverAppSession: session.BrowserAppSession | undefined
 let driverLocalFiles: LocalFileSource | undefined
 let knownSessions: BrowserKnownSessionRegistry | null = null
 /** Kept so teardown can force its erasures past the settings write debounce. */
@@ -470,6 +468,14 @@ function retireDriverScopeState(state: DriverScopeState): void {
     activeBrowserToolAdmissions.delete(admission)
   }
   state.toolAdmissions.clear()
+}
+
+function retireDriverScope(scopeId: string): void {
+  const resolved = resolveDriverScopeId(scopeId)
+  cancelPendingBrowserToolQueueBoundaries(resolved)
+  const state = driverScopeStates.get(resolved)
+  if (state) retireDriverScopeState(state)
+  driverScopeStates.delete(resolved)
 }
 
 function retireAllDriverScopeStates(): void {
@@ -707,7 +713,6 @@ export function initDriver(
   localFiles?: LocalFileSource
 ): void {
   driverCallbacks = callbacks
-  driverAppSession = appSession
   driverLocalFiles = localFiles
   void discardStagedUploads().catch(() => {})
   knownSessions = config ? new BrowserKnownSessionRegistry(config) : null
@@ -1041,14 +1046,25 @@ export async function clearBrowsingData(
 export interface ClearBrowserProfileOptions {
   /** The server picker will replace the blocked settings file immediately after profile erasure. */
   settingsPersistence: 'required' | 'server-repair'
+  /** Limits the wipe to one account's tabs and cookie jar; omitted, every account's goes. */
+  profileId?: string
 }
 
 export async function clearBrowserProfile(
   options: ClearBrowserProfileOptions = { settingsPersistence: 'required' }
 ): Promise<void> {
-  retireAllDriverScopeStates()
+  if (options.profileId) {
+    for (const scopeId of session.browserScopeIdsForProfile(options.profileId)) {
+      retireDriverScope(scopeId)
+    }
+  } else {
+    retireAllDriverScopeStates()
+  }
   const settingsCleared = knownSessions?.clear() !== false
-  const outcomes = await Promise.allSettled([session.clearProfileStorage(), clearCredentials()])
+  const outcomes = await Promise.allSettled([
+    session.clearProfileStorage(options.profileId),
+    clearCredentials(),
+  ])
   // Last, covering the saved tab list `clearProfileStorage` just emptied.
   // Settings writes coalesce, and an erasure that is still sitting in that
   // window when the process dies leaves the previous account's data on disk
@@ -2739,7 +2755,7 @@ async function executeToolInner(
       }
       assertCurrentExecution()
       return saveDownloadToWorkspace({
-        appSession: driverAppSession,
+        appSession: session.appSessionForScope(),
         toolCallId: requireActiveToolCallId(),
         filePath: download.savePath,
         filename: download.filename,
@@ -2766,7 +2782,7 @@ async function executeToolInner(
           scopeId: session.getBrowserScopeId(),
           toolCallId: requireActiveToolCallId(),
           paths,
-          appSession: driverAppSession,
+          appSession: session.appSessionForScope(),
           localFiles: driverLocalFiles,
           signal,
         })

@@ -291,6 +291,7 @@ describe('registerIpcHandlers', () => {
     localFilesystem = new LocalFilesystemService({ chooseDirectory: vi.fn(async () => null) })
     deps = {
       appOrigin: () => APP,
+      bindBrowserScope: vi.fn(),
       getExecutorDevice: () => null,
       allowHttpLocalhost: () => false,
       accountDataAvailable: () => true,

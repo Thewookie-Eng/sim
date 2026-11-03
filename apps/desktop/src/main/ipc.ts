@@ -333,6 +333,8 @@ export interface IpcDeps {
    * answers for the active account.
    */
   appOrigin: (sender?: WebContents) => string
+  /** Ties a chat's browser to the account of the window that names it. */
+  bindBrowserScope: (sender: WebContents, scopeId: string) => void
   allowHttpLocalhost: () => boolean
   /** False while local account-data persistence is unavailable or teardown must be retried. */
   accountDataAvailable: () => boolean
@@ -682,6 +684,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     const active = scopes.get(sender)
     if (active && active !== requested) return null
     if (!active) scopes.set(sender, requested)
+    if (scopes === browserScopeBySender) deps.bindBrowserScope(sender, requested)
     return requested
   }
 
@@ -699,6 +702,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   ): string | null => {
     const requested = parseDesktopScope(rawScope)
     if (requested && !scopes.has(sender)) scopes.set(sender, requested)
+    if (requested && scopes === browserScopeBySender) deps.bindBrowserScope(sender, requested)
     return requested
   }
 
@@ -1043,6 +1047,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
         if (!scope) return { tabs: [], activeTabId: null }
         const contents = sender as WebContents
         browserScopeBySender.set(contents, scope)
+        deps.bindBrowserScope(contents, scope)
         rememberPendingScope(browserPendingScopesBySender, contents, scope)
         deps.scopeEvents.activateBrowser(contents, scope)
         deps.browserPanel.activateScope(contents, scope)
@@ -2094,6 +2099,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
               error: 'This browser action is not an authorized pending Copilot tool call.',
             }
           }
+          deps.bindBrowserScope(event.sender, authorization.chatId)
           handlerArgs = [
             authorization.chatId,
             toolCallId,

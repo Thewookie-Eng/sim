@@ -42,9 +42,13 @@ import {
   setPanelOccluded as setBrowserAgentPanelOccluded,
 } from '@/main/browser-agent/panel'
 import {
+  agentPartitionFor,
+  type BrowserProfile,
+  bindBrowserScopeProfile,
   handleFocusedShortcut as handleFocusedBrowserShortcut,
   isBrowserScopeSuspended,
   quiesceBrowserSessions,
+  registerBrowserProfile,
   setBrowserDefaultZoom as setAgentBrowserDefaultZoom,
   setBrowserAppearanceTheme as setAgentBrowserTheme,
   setPanelFocused as setBrowserAgentPanelFocused,
@@ -372,12 +376,25 @@ function main(): void {
     }
   }
 
+  /**
+   * The agent browser profile for an account's chats: its own cookie jar, and
+   * its own Sim session for tabs that open Sim pages.
+   */
+  function browserProfileFor(account: Account, appSession: Session): BrowserProfile {
+    return {
+      id: account.id,
+      partition: agentPartitionFor(account.id),
+      appSession: { origin: account.origin, session: appSession },
+    }
+  }
+
   function ensureRuntime(account: Account): AccountRuntime {
     const existing = runtimes.get(account.id)
     if (existing) return existing
     const origin = () => account.origin
     const ses = configureSessionForAccount(account)
     const isPrimary = account.id === PRIMARY_ACCOUNT_ID
+    registerBrowserProfile(browserProfileFor(account, ses))
 
     const handoff = createHandoffManager(
       {
@@ -487,7 +504,10 @@ function main(): void {
         // live views. Clear task descriptors afterward so those snapshots
         // cannot recreate account-scoped state after sign-out.
         const failures: unknown[] = []
-        await clearAgentBrowserProfile().catch((error) => failures.push(error))
+        await clearAgentBrowserProfile({
+          settingsPersistence: 'required',
+          profileId: account.id,
+        }).catch((error) => failures.push(error))
         try {
           clearDesktopChatSessions()
         } catch (error) {
@@ -1092,6 +1112,10 @@ function main(): void {
     })
     registerIpcHandlers({
       appOrigin: (sender) => (sender ? originForContents(sender) : appOrigin()),
+      bindBrowserScope: (sender, scopeId) => {
+        const account = accountForContents(sender)
+        bindBrowserScopeProfile(scopeId, browserProfileFor(account, ensureRuntime(account).session))
+      },
       allowHttpLocalhost,
       accountDataAvailable,
       isLocalPageUrl,

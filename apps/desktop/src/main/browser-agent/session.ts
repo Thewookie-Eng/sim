@@ -77,6 +77,7 @@ import {
   withSessionCookieLifetime,
 } from '@/main/browser-agent/session-cookies'
 import { clearHostVerdictCache } from '@/main/browser-agent/url-guard'
+import { PRIMARY_ACCOUNT_ID } from '@/main/config'
 import type { BrowserSessionSnapshot } from '@/main/desktop-chat-session-store'
 import { suggestedFilename, uniqueDownloadPath } from '@/main/downloads'
 import {
@@ -104,6 +105,74 @@ export interface BrowserAppSession {
 }
 
 let browserAppSession: BrowserAppSession | undefined
+
+/**
+ * The cookie jar and Sim session one account's agent tabs use. Scopes bound to
+ * different accounts never share either, so a site signed in for one account
+ * is not signed in for the other.
+ */
+export interface BrowserProfile {
+  /** The account id; the primary account keeps the original partition. */
+  id: string
+  partition: string
+  appSession?: BrowserAppSession
+}
+
+const scopeProfiles = new Map<string, BrowserProfile>()
+const knownProfiles = new Map<string, BrowserProfile>()
+
+export function agentPartitionFor(accountId: string): string {
+  return accountId === PRIMARY_ACCOUNT_ID ? AGENT_PARTITION : `${AGENT_PARTITION}-${accountId}`
+}
+
+function defaultProfile(): BrowserProfile {
+  return { id: PRIMARY_ACCOUNT_ID, partition: AGENT_PARTITION, appSession: browserAppSession }
+}
+
+function profileForScope(scopeId = getBrowserScopeId()): BrowserProfile {
+  return scopeProfiles.get(resolveBrowserScopeId(scopeId)) ?? defaultProfile()
+}
+
+/** The Sim session file transfers for a scope authenticate with. */
+export function appSessionForScope(scopeId?: string): BrowserAppSession | undefined {
+  return profileForScope(scopeId).appSession
+}
+
+/** Makes an account's agent partition reachable by profile-wide clears. */
+export function registerBrowserProfile(profile: BrowserProfile): void {
+  knownProfiles.set(profile.id, profile)
+}
+
+/**
+ * Binds a chat's browser to the account whose window owns the chat. A scope
+ * that already has live tabs keeps the partition those tabs were created in.
+ */
+export function bindBrowserScopeProfile(scopeId: string, profile: BrowserProfile): void {
+  registerBrowserProfile(profile)
+  const resolved = resolveBrowserScopeId(scopeId)
+  if (
+    profileForScope(resolved).id !== profile.id &&
+    browserScopeStates.get(resolved)?.tabs.length
+  ) {
+    logger.warn('Browser scope already has tabs in another account profile')
+    return
+  }
+  scopeProfiles.set(resolved, profile)
+}
+
+function allProfiles(): BrowserProfile[] {
+  const profiles = new Map(knownProfiles)
+  if (!profiles.has(PRIMARY_ACCOUNT_ID)) profiles.set(PRIMARY_ACCOUNT_ID, defaultProfile())
+  for (const profile of scopeProfiles.values()) profiles.set(profile.id, profile)
+  return [...profiles.values()]
+}
+
+/** Scope ids whose tabs live in the given account's profile. */
+export function browserScopeIdsForProfile(profileId: string): string[] {
+  return [...browserScopeStates.keys()].filter(
+    (scopeId) => profileForScope(scopeId).id === profileId
+  )
+}
 const configuredDownloadSessions = new WeakSet<Session>()
 const routedNavigations = new WeakMap<WebContents, AgentTab>()
 
@@ -1185,6 +1254,11 @@ export function migrateBrowserScope(fromScopeId: string, toScopeId: string): boo
     trimBrowserDownloads(to)
     publishBrowserDownloads(to)
   }
+  const migratedProfile = scopeProfiles.get(from)
+  if (migratedProfile) {
+    scopeProfiles.delete(from)
+    if (!scopeProfiles.has(to)) scopeProfiles.set(to, migratedProfile)
+  }
   browserScopeAliases.set(from, to)
   if (
     (activeBrowserScopeId && resolveBrowserScopeId(activeBrowserScopeId) === to) ||
@@ -1224,6 +1298,7 @@ export function disposeBrowserScope(scopeId: string): void {
     })
     browserScopeStates.delete(resolved)
   }
+  scopeProfiles.delete(resolved)
   for (const [alias, target] of browserScopeAliases) {
     if (alias === resolved || resolveBrowserScopeId(target) === resolved) {
       browserScopeAliases.delete(alias)
@@ -1346,8 +1421,10 @@ function persistBrowserSession(): boolean {
 
 /** Read cookie metadata from the dedicated profile without exposing values. */
 export async function listAgentCookieSignals(): Promise<BrowserCookieSignal[]> {
-  const cookies = await electronSession.fromPartition(AGENT_PARTITION).cookies.get({})
-  return cookies.flatMap(({ domain }) => (typeof domain === 'string' ? [{ domain }] : []))
+  const jars = await Promise.all(
+    allProfiles().map((profile) => electronSession.fromPartition(profile.partition).cookies.get({}))
+  )
+  return jars.flat().flatMap(({ domain }) => (typeof domain === 'string' ? [{ domain }] : []))
 }
 
 /**
@@ -2165,10 +2242,8 @@ export function stopFindInActiveTab(focusPage: boolean): void {
  */
 function canAdoptPopup(opener: WebContents, url: string): boolean {
   if (!/^https?:\/\//i.test(url) || !hasTabCapacity()) return false
-  return (
-    !browserAppSession ||
-    isAppOrigin(url, browserAppSession.origin) === Boolean(agentAppOrigin(opener))
-  )
+  const appSession = appSessionForScope()
+  return !appSession || isAppOrigin(url, appSession.origin) === Boolean(agentAppOrigin(opener))
 }
 
 /** Registers a page-opened window as a tab that remembers its opener. */
@@ -2239,12 +2314,15 @@ type PopupWindowOptions = BrowserWindowConstructorOptions & WebContentsViewConst
  * intact; callers only adopt popups whose URL belongs to the opener's session.
  */
 function createTabView(url?: string, popup?: PopupWindowOptions): WebContentsView {
-  const appSession =
-    url && browserAppSession && isAppOrigin(url, browserAppSession.origin)
-      ? browserAppSession
-      : undefined
   const scopeId = getBrowserScopeId()
-  const view = popup?.webContents ? new WebContentsView(popup) : createFreshTabView(appSession)
+  const profile = profileForScope(scopeId)
+  const appSession =
+    url && profile.appSession && isAppOrigin(url, profile.appSession.origin)
+      ? profile.appSession
+      : undefined
+  const view = popup?.webContents
+    ? new WebContentsView(popup)
+    : createFreshTabView(profile.partition, appSession)
   try {
     /** Detached tabs must lay out before a foreground panel owns their native view. */
     const [width, height] = getMainWindow()?.getContentSize() ?? [1280, 720]
@@ -2256,10 +2334,13 @@ function createTabView(url?: string, popup?: PopupWindowOptions): WebContentsVie
   }
 }
 
-function createFreshTabView(appSession: BrowserAppSession | undefined): WebContentsView {
+function createFreshTabView(
+  partition: string,
+  appSession: BrowserAppSession | undefined
+): WebContentsView {
   return new WebContentsView({
     webPreferences: {
-      ...(appSession ? { session: appSession.session } : { partition: AGENT_PARTITION }),
+      ...(appSession ? { session: appSession.session } : { partition }),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
@@ -2303,8 +2384,9 @@ function initializeTabView(
   if (appOrigin) configureBrowserDownloads(contents.session)
   else configureAgentPartition(contents.session)
   const routeNavigation = (url: string, method: string): boolean => {
-    if (!/^https?:\/\//i.test(url) || !browserAppSession) return false
-    const wantsAppSession = isAppOrigin(url, browserAppSession.origin)
+    const scopeAppSession = appSessionForScope(scopeId)
+    if (!/^https?:\/\//i.test(url) || !scopeAppSession) return false
+    const wantsAppSession = isAppOrigin(url, scopeAppSession.origin)
     if (wantsAppSession === Boolean(appOrigin)) {
       routedNavigations.delete(contents)
       return false
@@ -3071,8 +3153,9 @@ export function tabForNavigation(
   options: { agentOwned?: boolean; reuseBlank?: boolean } = {}
 ): WebContents {
   const tab = tabForContents(contents)
-  if (!tab || !browserAppSession) return contents
-  const wantsAppSession = isAppOrigin(url, browserAppSession.origin)
+  const appSession = tab ? appSessionForScope(tab.scopeId) : undefined
+  if (!tab || !appSession) return contents
+  const wantsAppSession = isAppOrigin(url, appSession.origin)
   if (wantsAppSession === Boolean(agentAppOrigin(contents))) return contents
   if (options.reuseBlank !== false && (!contents.getURL() || contents.getURL() === 'about:blank')) {
     const view = createTabView(url)
@@ -3668,11 +3751,12 @@ export function closeSession(): void {
  * on this machine cannot inherit the previous user's authenticated sessions,
  * saved tabs, or browsing trail.
  */
-export async function clearProfileStorage(): Promise<void> {
+export async function clearProfileStorage(profileId?: string): Promise<void> {
   // Cached DNS verdicts are part of the browsing trail: without this a wipe
   // leaves up to the TTL of resolved-host classifications behind.
   clearHostVerdictCache()
-  for (const scopeId of browserScopeStates.keys()) {
+  const scopeIds = profileId ? browserScopeIdsForProfile(profileId) : [...browserScopeStates.keys()]
+  for (const scopeId of scopeIds) {
     withBrowserScope(scopeId, () => {
       closeLiveTabs()
       browserDownloadsByScope.delete(scopeId)
@@ -3689,15 +3773,22 @@ export async function clearProfileStorage(): Promise<void> {
       events?.onTabsChanged()
     })
   }
-  browserDownloadsByScope.clear()
-  cancelActiveBrowserDownloads()
+  if (profileId) {
+    for (const scopeId of scopeIds) cancelActiveBrowserDownloads(scopeId)
+  } else {
+    browserDownloadsByScope.clear()
+    cancelActiveBrowserDownloads()
+  }
   layout()
 
-  const ses = electronSession.fromPartition(AGENT_PARTITION)
-  // No `storages` filter: a profile wipe should leave nothing behind, and an
-  // allowlist would silently miss whatever Chromium adds next.
-  await ses.clearStorageData()
-  await ses.clearCache()
+  for (const profile of allProfiles()) {
+    if (profileId && profile.id !== profileId) continue
+    const ses = electronSession.fromPartition(profile.partition)
+    // No `storages` filter: a profile wipe should leave nothing behind, and an
+    // allowlist would silently miss whatever Chromium adds next.
+    await ses.clearStorageData()
+    await ses.clearCache()
+  }
 }
 
 /**
@@ -3723,16 +3814,18 @@ const SITE_DATA_STORAGES = [
  * passwords live in a separate vault and are never touched here.
  */
 export async function clearAgentData(kinds: readonly BrowserDataKind[]): Promise<void> {
-  const ses = electronSession.fromPartition(AGENT_PARTITION)
   const storages: string[] = []
   if (kinds.includes('cookies')) storages.push('cookies')
   if (kinds.includes('site-data')) storages.push(...SITE_DATA_STORAGES)
 
-  if (storages.length > 0) {
-    await ses.clearStorageData({ storages } as Parameters<Session['clearStorageData']>[0])
+  for (const profile of allProfiles()) {
+    const ses = electronSession.fromPartition(profile.partition)
+    if (storages.length > 0) {
+      await ses.clearStorageData({ storages } as Parameters<Session['clearStorageData']>[0])
+    }
+    if (kinds.includes('cache')) await ses.clearCache()
   }
   if (kinds.includes('cache')) {
-    await ses.clearCache()
     // Resolved-host verdicts are a cache too, and a user clearing the cache
     // means all of it.
     clearHostVerdictCache()
