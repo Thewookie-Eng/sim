@@ -211,11 +211,12 @@ async function generate() {
   const dates = lastModified()
   let compiled = 0
   for (const file of await filesIn(CONTENT_ROOT)) {
-    const relative = path.relative(CONTENT_ROOT, file)
+    // Page and folder keys are URL-shaped; Windows' path.relative separates with backslashes.
+    const relative = path.relative(CONTENT_ROOT, file).split(path.sep).join('/')
     if (relative.endsWith('meta.json')) {
       const parsed = metadataSchema.safeParse(JSON.parse(await readFile(file, 'utf8')))
       if (!parsed.success) throw new Error(`${relative}: ${parsed.error.message}`)
-      const directory = path.dirname(relative)
+      const directory = path.posix.dirname(relative)
       metadata[directory === '.' ? '' : directory] = parsed.data
       continue
     }
