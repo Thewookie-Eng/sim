@@ -7,6 +7,7 @@ import { azureDevOpsHandler } from '@/lib/webhooks/providers/azure-devops'
 import { bitbucketHandler } from '@/lib/webhooks/providers/bitbucket'
 import { calcomHandler } from '@/lib/webhooks/providers/calcom'
 import { calendlyHandler } from '@/lib/webhooks/providers/calendly'
+import { checkrHandler } from '@/lib/webhooks/providers/checkr'
 import { circlebackHandler } from '@/lib/webhooks/providers/circleback'
 import { clerkHandler } from '@/lib/webhooks/providers/clerk'
 import { clickupHandler } from '@/lib/webhooks/providers/clickup'
@@ -15,6 +16,7 @@ import { credentialGroupProviderHandler } from '@/lib/webhooks/providers/credent
 import { emailBisonHandler } from '@/lib/webhooks/providers/emailbison'
 import { fathomHandler } from '@/lib/webhooks/providers/fathom'
 import { firefliesHandler } from '@/lib/webhooks/providers/fireflies'
+import { fivetranHandler } from '@/lib/webhooks/providers/fivetran'
 import { genericHandler } from '@/lib/webhooks/providers/generic'
 import { githubHandler } from '@/lib/webhooks/providers/github'
 import { gitlabHandler } from '@/lib/webhooks/providers/gitlab'
@@ -24,6 +26,7 @@ import { googleFormsHandler } from '@/lib/webhooks/providers/google-forms'
 import { grainHandler } from '@/lib/webhooks/providers/grain'
 import { granolaHandler } from '@/lib/webhooks/providers/granola'
 import { greenhouseHandler } from '@/lib/webhooks/providers/greenhouse'
+import { helpScoutHandler } from '@/lib/webhooks/providers/helpscout'
 import { imapHandler } from '@/lib/webhooks/providers/imap'
 import { incidentioHandler } from '@/lib/webhooks/providers/incidentio'
 import { instantlyHandler } from '@/lib/webhooks/providers/instantly'
@@ -78,6 +81,7 @@ const PROVIDER_HANDLERS: Record<string, WebhookProviderHandler> = {
   bitbucket: bitbucketHandler,
   calendly: calendlyHandler,
   calcom: calcomHandler,
+  checkr: checkrHandler,
   circleback: circlebackHandler,
   clerk: clerkHandler,
   clickup: clickupHandler,
@@ -85,6 +89,7 @@ const PROVIDER_HANDLERS: Record<string, WebhookProviderHandler> = {
   'credential-group': credentialGroupProviderHandler,
   emailbison: emailBisonHandler,
   fireflies: firefliesHandler,
+  fivetran: fivetranHandler,
   generic: genericHandler,
   gmail: gmailHandler,
   github: githubHandler,
@@ -95,6 +100,7 @@ const PROVIDER_HANDLERS: Record<string, WebhookProviderHandler> = {
   grain: grainHandler,
   granola: granolaHandler,
   greenhouse: greenhouseHandler,
+  helpscout: helpScoutHandler,
   imap: imapHandler,
   incidentio: incidentioHandler,
   intercom: intercomHandler,

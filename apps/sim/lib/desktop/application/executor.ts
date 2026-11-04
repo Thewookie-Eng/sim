@@ -5,23 +5,25 @@ import { generateId } from '@sim/utils/id'
 import { isPlainRecord, omit } from '@sim/utils/object'
 import { defineOperation } from '@/lib/core/application'
 import { OrchestrationError } from '@/lib/core/orchestration/types'
+import { createDetachedTouch } from '@/lib/core/utils/background'
 import {
   type CredentialUserAuditEntry,
   defineAuthorizedCredentialUserUseCase,
 } from '@/lib/credentials/application/authorized-user-use-case'
+import { isDesktopBackgroundExecutorAvailable } from '@/lib/desktop/executor/availability'
 import {
   DESKTOP_EXECUTOR_PROTOCOL_VERSION,
   DESKTOP_INBOX_RECONCILE_MS,
 } from '@/lib/desktop/executor/constants'
 import {
   type DesktopInboxChangeReason,
+  desktopInboxDoorbellReady,
   onDesktopInboxDoorbell,
 } from '@/lib/desktop/executor/doorbell'
 import {
   DesktopCallRevokedError,
   DesktopDeviceUnrecognizedError,
 } from '@/lib/desktop/executor/errors'
-import { isDesktopBackgroundExecutorEnabled } from '@/lib/desktop/executor/flag'
 import { classifyDesktopInbox, type DesktopInboxEntry } from '@/lib/desktop/executor/inbox'
 import { markDesktopPresent } from '@/lib/desktop/executor/presence'
 import {
@@ -40,6 +42,7 @@ import {
 import {
   claimDesktopToolCall,
   type DesktopToolCallClaim,
+  getAsyncToolCall,
   renewSimToolExecutionLease,
 } from '@/lib/mothership/async-runs/repository'
 import { sealClientToolSettlement } from '@/lib/mothership/request/tools/client-completion-seal.server'
@@ -49,11 +52,22 @@ import {
   settleClientToolCall,
 } from '@/lib/mothership/request/tools/client-settlement.server'
 import {
+  chatViewDesktopLeaseOwnerToken,
   getDesktopExecutorClaimOwner,
-  isDesktopToolCall,
+  isBackgroundDesktopToolCall,
 } from '@/lib/mothership/tools/desktop-tools'
 
 const logger = createLogger('DesktopExecutor')
+
+/**
+ * An inbox poll never waits on its `lastSeenAt` write or stacks one behind another. Not debounced
+ * in-process: the offline check reads `lastSeenAt`, and the write's own SQL guard already bounds
+ * how often it lands.
+ */
+const touchDeviceLastSeen = createDetachedTouch({
+  label: 'desktop device last seen',
+  write: touchDesktopDevice,
+})
 
 type DeviceInput = { deviceId: string }
 
@@ -69,15 +83,15 @@ async function requireBoundDevice(principal: SessionPrincipal, deviceId: string)
 }
 
 /**
- * The device a new turn binds to: the composer's own, but only while the executor is on for this
- * user and the device is registered to this very session as an executor. Anything else leaves
+ * The device a new turn binds to: the composer's own, but only while this install can run the
+ * executor and the device is registered to this very session as an executor. Anything else leaves
  * the turn to the chat view, as before the executor existed.
  */
 export async function resolveTurnDesktopDevice(
   principal: SessionPrincipal,
   deviceId: string
 ): Promise<string | null> {
-  if (!(await isDesktopBackgroundExecutorEnabled(principal.userId))) return null
+  if (!isDesktopBackgroundExecutorAvailable()) return null
   const device = await getBoundDesktopDevice(
     { deviceId, userId: principal.userId, sessionId: principal.sessionId },
     { executor: true }
@@ -100,8 +114,8 @@ interface RegisterDesktopDeviceInput extends DeviceInput {
 }
 
 /**
- * Binds the install to this user and session. With the executor turned off nothing is written,
- * and the device stays dormant.
+ * Binds the install to this user and session. Where the executor is unavailable nothing is
+ * written, and the device stays dormant.
  */
 export const registerDesktopDevice = defineAuthorizedCredentialUserUseCase({
   // permission-group-exempt: registering grants no access; each call's run was admitted under the Chat capability.
@@ -117,7 +131,7 @@ export const registerDesktopDevice = defineAuthorizedCredentialUserUseCase({
     principal: SessionPrincipal
     input: RegisterDesktopDeviceInput
   }) {
-    const enabled = await isDesktopBackgroundExecutorEnabled(principal.userId)
+    const enabled = isDesktopBackgroundExecutorAvailable()
     if (enabled) {
       const registered = await upsertDesktopDevice({
         id: input.deviceId,
@@ -166,10 +180,10 @@ export const listDesktopInbox = defineAuthorizedCredentialUserUseCase({
     input: DeviceInput
   }): Promise<{ items: DesktopInboxEntry[] }> {
     await requireBoundDevice(principal, input.deviceId)
+    touchDeviceLastSeen(input.deviceId)
     const [rows] = await Promise.all([
       listDesktopInboxRows({ deviceId: input.deviceId, userId: principal.userId }),
       markDesktopPresent(input.deviceId),
-      touchDesktopDevice(input.deviceId),
     ])
     return { items: classifyDesktopInbox(rows) }
   },
@@ -201,6 +215,7 @@ export const openDesktopInboxStream = defineAuthorizedCredentialUserUseCase({
         onDesktopInboxDoorbell(deviceId, (reason: DesktopInboxChangeReason) =>
           send('inbox_changed', { reason })
         ),
+      ready: desktopInboxDoorbellReady,
     }
   },
 })
@@ -273,7 +288,7 @@ export const claimDesktopTool = defineAuthorizedCredentialUserUseCase({
     )
     if (!call) throw new OrchestrationError('not_found', 'Desktop tool call not found')
     const args = isPlainRecord(call.args) ? call.args : {}
-    if (!isDesktopToolCall(call.toolName, args))
+    if (!isBackgroundDesktopToolCall(call.toolName, args))
       throw new OrchestrationError('forbidden', 'Tool call is not authorized for desktop execution')
     if (call.toolName === 'import_local_files') {
       if (typeof args.targetWorkspaceId !== 'string')
@@ -327,9 +342,19 @@ interface DesktopCallTokenInput extends DeviceInput {
   executionToken: string
 }
 
-/** Keeps a running call owned; failing here always means the device must stop the action. */
+/** A desktop call the chat view is running, renewed by the session that claimed it. */
+interface ChatViewCallInput {
+  toolCallId: string
+  chatView: true
+}
+
+/**
+ * Keeps a running call owned; failing here always means the device must stop the action. A
+ * device renews a call of a run bound to it under its execution token. The chat view renews an
+ * import it claimed on an unbound run: only the session that claimed it, while it runs.
+ */
 export const renewDesktopToolLease = defineAuthorizedCredentialUserUseCase({
-  // permission-group-exempt: extends only a lease this device's token already holds.
+  // permission-group-exempt: extends only a lease this device's token, or this session, already holds.
   operation: defineOperation({
     id: 'desktop.executor.calls.renew',
     principalKinds: ['session'],
@@ -340,8 +365,24 @@ export const renewDesktopToolLease = defineAuthorizedCredentialUserUseCase({
     input,
   }: {
     principal: SessionPrincipal
-    input: DesktopCallTokenInput
+    input: DesktopCallTokenInput | ChatViewCallInput
   }) {
+    if ('chatView' in input) {
+      const call = await getAsyncToolCall(input.toolCallId)
+      const renewed =
+        call !== null &&
+        (await renewSimToolExecutionLease(
+          {
+            toolCallId: call.toolCallId,
+            runId: call.runId,
+            userId: principal.userId,
+            ownerToken: chatViewDesktopLeaseOwnerToken(principal.sessionId),
+          },
+          { chatView: true }
+        ))
+      if (!renewed) throw new DesktopCallRevokedError()
+      return { renewed: true as const }
+    }
     await requireBoundDevice(principal, input.deviceId)
     await markDesktopPresent(input.deviceId)
     const call = await getBoundDesktopCall(

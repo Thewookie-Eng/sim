@@ -108,12 +108,16 @@ app:
     # Generate secure 32-character secrets using: openssl rand -hex 32
     BETTER_AUTH_SECRET: ""  # REQUIRED - set via --set flag or external secret manager
     ENCRYPTION_KEY: ""      # REQUIRED - set via --set flag or external secret manager
+    # A 64-hex ENCRYPTION_KEY also seals stored OAuth account tokens, and the migrations init
+    # container seals the ones stored before. To opt out, set ENCRYPT_ACCOUNT_TOKENS to "false"
+    # or "0" wherever the app reads its env: here (inline or existingSecret mode), as a key in the
+    # pre-created Secret, mapped in externalSecrets.remoteRefs.app (External Secrets mode), or in
+    # app.envDefaults / extraEnvVars. The init container resolves it the same way as the app.
     INTERNAL_API_SECRET: ""  # REQUIRED - set via --set flag or external secret manager, used for internal service-to-service authentication
 
     # Optional: Scheduled Jobs Authentication
     # Generate using: openssl rand -hex 32
     CRON_SECRET: ""         # OPTIONAL - required only if cronjobs.enabled=true, authenticates scheduled job requests
-    TABLE_ROW_TTL: ""       # Enable TTL columns and expired-row cleanup when AppConfig is unavailable
     KNOWLEDGE_MEMBER_ACCESS: ""  # Enable per-member knowledge connectors when AppConfig is unavailable
 
     # Optional: API Key Encryption (RECOMMENDED for production)
@@ -1504,6 +1508,17 @@ cronjobs:
       successfulJobsHistoryLimit: 3
       failedJobsHistoryLimit: 1
 
+    peopleDirectorySync:
+      enabled: true
+      name: people-directory-sync
+      schedule: "*/5 * * * *"
+      path: "/api/cron/people-directory-sync"
+      requestTimeoutSeconds: 300
+      activeDeadlineSeconds: 360
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 1
+
     # Re-applies directory group mappings so drift between what a mapping says a
     # member should have and what SCIM granted them cannot persist. Idempotent,
     # and a no-op for organizations with no connection.
@@ -1549,6 +1564,18 @@ cronjobs:
       successfulJobsHistoryLimit: 3
       failedJobsHistoryLimit: 1
 
+    # Kills chat workbenches the sandbox provider paused once they went idle. The
+    # provider keeps paused sandboxes indefinitely, so this bounds how long a
+    # workbench outlives its last use. A no-op without a session-capable provider.
+    cleanupSessionSandboxes:
+      enabled: true
+      name: cleanup-session-sandboxes
+      schedule: "*/5 * * * *"
+      path: "/api/cron/cleanup-session-sandboxes"
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 1
+
     # Processes the transactional outbox (deployment side-effects retry / dead-letter)
     # and reaps stale workspace-fork background-work rows. Both are safety nets behind
     # the immediate post-commit processing, so frequent runs keep retries timely.
@@ -1589,6 +1616,31 @@ cronjobs:
       name: fold-table-row-changes
       schedule: "*/1 * * * *"
       path: "/api/cron/fold-table-row-changes"
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 1
+
+    # Fails runs whose worker died without writing a terminal state (workflow
+    # executions, async jobs, table jobs and dispatches) and prunes old terminal
+    # bookkeeping rows.
+    cleanupStaleExecutions:
+      enabled: true
+      name: cleanup-stale-executions
+      schedule: "*/30 * * * *"
+      path: "/api/cron/cleanup-stale-executions"
+      concurrencyPolicy: Forbid
+      successfulJobsHistoryLimit: 3
+      failedJobsHistoryLimit: 1
+
+    # Deletes idempotency records older than seven days, the longest dedupe
+    # window any caller uses. Runs inline in the request for up to five minutes.
+    idempotencyCleanup:
+      enabled: true
+      name: idempotency-cleanup
+      schedule: "0 5 * * *"
+      path: "/api/webhooks/cleanup/idempotency"
+      requestTimeoutSeconds: 300
+      activeDeadlineSeconds: 360
       concurrencyPolicy: Forbid
       successfulJobsHistoryLimit: 3
       failedJobsHistoryLimit: 1
@@ -1980,6 +2032,9 @@ externalSecrets:
       CRON_SECRET: ""
       # Path to API_ENCRYPTION_KEY in external store (optional)
       API_ENCRYPTION_KEY: ""
+      # Path to ENCRYPT_ACCOUNT_TOKENS in external store (optional; "false" or "0" opts out of
+      # account token sealing)
+      ENCRYPT_ACCOUNT_TOKENS: ""
       # Path to MSHIP_SYSPROMPT_OVERRIDE in external store (optional)
       MSHIP_SYSPROMPT_OVERRIDE: ""
       # Path to REDIS_URL in external store (optional)

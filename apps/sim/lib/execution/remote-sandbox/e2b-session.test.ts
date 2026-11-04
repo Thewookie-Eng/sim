@@ -6,6 +6,7 @@ const {
   create,
   list,
   connect,
+  pause,
   nextItems,
   getInfo,
   writeFile,
@@ -22,6 +23,7 @@ const {
   create: vi.fn(),
   list: vi.fn(),
   connect: vi.fn(),
+  pause: vi.fn(),
   nextItems: vi.fn(),
   getInfo: vi.fn(),
   writeFile: vi.fn(),
@@ -36,22 +38,28 @@ const {
   NotFoundError: class NotFoundError extends Error {},
 }))
 vi.mock('@e2b/code-interpreter', () => ({
-  Sandbox: { create, list, connect, getInfo },
+  Sandbox: { create, list, connect, pause, getInfo },
   NotFoundError,
 }))
 vi.mock('@/lib/execution/remote-sandbox/session-lock', () => ({
   withSandboxSessionLock: sessionLock,
 }))
 
-import { e2bProvider, stopE2BSessionProcess } from '@/lib/execution/remote-sandbox/e2b'
-import { observeSandboxExecution } from '@/lib/execution/remote-sandbox/execution-observer'
+import {
+  E2B_MAX_SANDBOX_LIFETIME_MS,
+  e2bProvider,
+  stopE2BSessionProcess,
+} from '@/lib/execution/remote-sandbox/e2b'
+import { observeSandboxExecution } from '@/lib/execution/remote-sandbox/observer'
+import { SessionCliStaleError } from '@/lib/execution/remote-sandbox/session-cli'
 
 setEnv({ E2B_API_KEY: 'test', MOTHERSHIP_E2B_TEMPLATE_ID: 'mothership-template' })
 
 function candidate(sandboxId: string, time: number) {
   return {
     sandboxId,
-    startedAt: new Date(time),
+    state: 'running',
+    startedAt: new Date(Date.now() - 3_600_000 + time),
     endAt: new Date(Date.now() + 3_600_000),
     metadata: { simSessionKey: 'chat', simSessionOwnership: 'tracked-v1' },
   }
@@ -85,7 +93,7 @@ describe('E2B session recovery', () => {
     const sandbox = {
       sandboxId: 'retained',
       getInfo,
-      files: { write: writeFile, read: readFile },
+      files: { write: writeFile, read: readFile, remove: vi.fn().mockResolvedValue(undefined) },
       setTimeout,
       commands: {
         run: (command: string, options: { background?: boolean }) =>
@@ -324,6 +332,7 @@ describe('E2B session recovery', () => {
   })
 
   it('searches paused workbenches and all pages before choosing the canonical session', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now())
     let pages = 2
     list.mockReturnValue({
       nextItems,
@@ -605,6 +614,131 @@ describe('E2B session recovery', () => {
     expect(stopCommand).toHaveBeenCalledOnce()
     expect(killSandbox).not.toHaveBeenCalled()
   })
+
+  it('returns what a session command printed before its own timeout stopped it', async () => {
+    runCommand.mockImplementation(
+      async (
+        _command: string,
+        options: { onStdout?: (chunk: string) => void; onStderr?: (chunk: string) => void }
+      ) => {
+        options.onStdout?.('rendered 1 of 3\n')
+        options.onStderr?.('slow frame\n')
+        options.onStdout?.('rendered 2 of 3\n')
+        return {
+          pid: 7,
+          wait: async () => {
+            throw Object.assign(
+              new Error("deadline_exceeded: This error is likely due to exceeding 'timeoutMs'"),
+              { name: 'TimeoutError' }
+            )
+          },
+        }
+      }
+    )
+    const sandbox = await sessionSandbox('reconnected')
+    const result = await sandbox?.runCommand('render', { timeoutMs: 1000 })
+    expect(result).toMatchObject({
+      timedOut: true,
+      exitCode: 124,
+      stdout: 'rendered 1 of 3\nrendered 2 of 3\n',
+      stderr: 'slow frame\n',
+    })
+  })
+  describe('when an abort lands before E2B replies', () => {
+    /** Streams one chunk, then the abort lands while the command waits on E2B. */
+    function abortWhileWaiting(controller: AbortController, reason: Error): void {
+      runCommand.mockImplementationOnce(
+        async (_command: string, options: { onStdout?: (chunk: string) => void }) => {
+          options.onStdout?.('rendered 1 of 3\n')
+          return {
+            pid: 8,
+            wait: () =>
+              new Promise((_resolve, reject) => {
+                controller.signal.addEventListener(
+                  'abort',
+                  () => reject(new Error('stream aborted')),
+                  { once: true }
+                )
+                controller.abort(reason)
+              }),
+          }
+        }
+      )
+    }
+
+    async function run(kind: 'code' | 'command', signal: AbortSignal, oneShot = false) {
+      const sandbox = oneShot
+        ? await e2bProvider.create('mothership', {})
+        : await sessionSandbox('reconnected')
+      if (!sandbox) throw new Error('Missing sandbox')
+      return kind === 'code'
+        ? sandbox.runCode('render()', { timeoutMs: 10_000, signal })
+        : sandbox.runCommand('render', { timeoutMs: 10_000, signal })
+    }
+
+    it.each(['code', 'command'] as const)(
+      'returns what the %s printed when its own deadline stops it',
+      async (kind) => {
+        const controller = new AbortController()
+        abortWhileWaiting(controller, new DOMException('timeout', 'AbortError'))
+        const result = await run(kind, controller.signal)
+        expect(result).toMatchObject({ timedOut: true, stdout: 'rendered 1 of 3\n' })
+        expect(stopCommand).toHaveBeenCalledOnce()
+      }
+    )
+
+    it('keeps a Stop of running code a cancellation', async () => {
+      const controller = new AbortController()
+      abortWhileWaiting(controller, new Error('User Stop'))
+      await expect(run('code', controller.signal)).rejects.toThrow('stream aborted')
+      expect(stopCommand).toHaveBeenCalledOnce()
+    })
+
+    it('leaves a one-shot sandbox’s deadline to the caller', async () => {
+      const controller = new AbortController()
+      abortWhileWaiting(controller, new DOMException('timeout', 'AbortError'))
+      await expect(run('code', controller.signal, true)).rejects.toThrow('stream aborted')
+    })
+
+    it('never reports a Stop of a command as its timeout', async () => {
+      const controller = new AbortController()
+      abortWhileWaiting(controller, new Error('User Stop'))
+      const result = await run('command', controller.signal)
+      expect(result.timedOut).toBeUndefined()
+      expect(stopCommand).toHaveBeenCalledOnce()
+    })
+  })
+
+  it.each([
+    ['stale', SessionCliStaleError],
+    ['failed', Error],
+  ] as const)(
+    'rejects a launch whose receipt reports a %s CLI, whatever its process returned',
+    async (cli, expected) => {
+      runCommand.mockResolvedValue({
+        pid: 9,
+        wait: async () => ({ stdout: '', stderr: '', exitCode: 0 }),
+      })
+      stopCommand.mockResolvedValue({
+        stdout: JSON.stringify({ settled: true, cli }),
+        stderr: '',
+        exitCode: 0,
+      })
+      const sandbox = await sessionSandbox('reconnected')
+      const launched = sandbox?.runCommand('touch /tmp/marker', {
+        timeoutMs: 1000,
+        verifyCli: { path: '/home/user/.sim-cli/r/cli.mjs', artifacts: { a: 'b' } },
+      })
+      await expect(launched).rejects.toBeInstanceOf(expected)
+      await expect(launched).rejects.toThrow(cli === 'stale' ? 'changed' : 'verification failed')
+      const [command] = runCommand.mock.calls.at(-1) ?? []
+      expect(command).toContain(
+        Buffer.from(
+          JSON.stringify({ path: '/home/user/.sim-cli/r/cli.mjs', artifacts: { a: 'b' } })
+        ).toString('base64')
+      )
+    }
+  )
 })
 
 describe('E2B session lease', () => {
@@ -679,5 +813,119 @@ describe('E2B session lease', () => {
     expect(plane.requests).toBe(3)
     await sandbox?.extendLifetime?.(IDLE_MS)
     expect(plane.requests).toBe(3)
+  })
+})
+
+describe('E2B continuous-runtime cap', () => {
+  const CAP_MS = E2B_MAX_SANDBOX_LIFETIME_MS
+  const LEASE_MS = 21 * 60_000
+
+  /** Models E2B: every timeout is clamped to the cap, and resuming a paused sandbox restarts it. */
+  function cappedPlane(runningForMs: number) {
+    const plane = { startedAtMs: Date.now() - runningForMs, endAtMs: 0, paused: false }
+    const clampedEnd = (timeoutMs: number) =>
+      Math.min(Date.now() + timeoutMs, plane.startedAtMs + CAP_MS)
+    plane.endAtMs = clampedEnd(5 * 60_000)
+    list.mockReturnValue({ nextItems, hasNext: false })
+    nextItems.mockImplementation(async () => [
+      {
+        ...candidate('retained', 0),
+        state: plane.paused ? 'paused' : 'running',
+        startedAt: new Date(plane.startedAtMs),
+        endAt: new Date(plane.endAtMs),
+      },
+    ])
+    pause.mockImplementation(async () => {
+      plane.paused = true
+      return true
+    })
+    const sandbox = {
+      sandboxId: 'retained',
+      getInfo: async () => ({ endAt: new Date(plane.endAtMs) }),
+      setTimeout: async (timeoutMs: number) => {
+        plane.endAtMs = clampedEnd(timeoutMs)
+      },
+      commands: {
+        run: async (_command: string, options: { background?: boolean }) => {
+          if (options.background === false) {
+            return { stdout: '{"settled": true}', stderr: '', exitCode: 0 }
+          }
+          throw Object.assign(new Error('Sandbox timeout: end of life'), { name: 'TimeoutError' })
+        },
+      },
+    }
+    connect.mockImplementation(async (_id: string, options: { timeoutMs: number }) => {
+      if (plane.paused) {
+        plane.paused = false
+        plane.startedAtMs = Date.now()
+      }
+      plane.endAtMs = clampedEnd(options.timeoutMs)
+      return sandbox
+    })
+    return plane
+  }
+
+  it('never records a reused lease past the cap when the runtime cannot be reset', async () => {
+    const plane = cappedPlane(CAP_MS - 10 * 60_000)
+    pause.mockRejectedValueOnce(new Error('pause unavailable'))
+    const sandbox = await e2bProvider.findSessionSandbox?.('chat', { lifetimeMs: LEASE_MS })
+    const now = Date.now()
+    expect(plane.endAtMs).toBeLessThan(now + LEASE_MS)
+    expect(sandbox?.outlives?.(LEASE_MS, now)).toBe(false)
+    expect(sandbox?.outlives?.(plane.endAtMs - now - 1000, now)).toBe(true)
+    await sandbox?.extendLifetime?.(LEASE_MS)
+    expect(sandbox?.outlives?.(LEASE_MS, Date.now())).toBe(false)
+  })
+
+  it('pauses and resumes a workbench whose lease would outrun the cap', async () => {
+    const plane = cappedPlane(CAP_MS - 10 * 60_000)
+    const requestedAtMs = Date.now()
+    const sandbox = await e2bProvider.findSessionSandbox?.('chat', { lifetimeMs: LEASE_MS })
+    expect(plane.startedAtMs).toBeGreaterThanOrEqual(requestedAtMs)
+    expect(plane.endAtMs).toBeGreaterThanOrEqual(requestedAtMs + LEASE_MS)
+    expect(sandbox?.outlives?.(LEASE_MS, requestedAtMs)).toBe(true)
+  })
+
+  it('reports reaching the cap as the provider limit, not a user timeout', async () => {
+    cappedPlane(CAP_MS - 30_000)
+    pause.mockRejectedValueOnce(new Error('pause unavailable'))
+    const sandbox = await e2bProvider.findSessionSandbox?.('chat', { lifetimeMs: LEASE_MS })
+    const result = await sandbox?.runCommand('long job', { timeoutMs: LEASE_MS })
+    expect(result?.providerFailure).toBe('provider_limit')
+    expect(result?.timedOut).toBeUndefined()
+  })
+
+  it('measures the command deadline from dispatch, after a slow ownership write', async () => {
+    cappedPlane(CAP_MS - 30_000)
+    pause.mockRejectedValueOnce(new Error('pause unavailable'))
+    const sandbox = await e2bProvider.findSessionSandbox?.('chat', { lifetimeMs: LEASE_MS })
+    if (!sandbox) throw new Error('Missing sandbox')
+    const realNow = Date.now
+    let ownershipWriteMs = 0
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => realNow() + ownershipWriteMs)
+    try {
+      const result = await observeSandboxExecution(
+        {
+          hold: vi.fn(),
+          unsettled: vi.fn(),
+          claimProcess: async () => {
+            ownershipWriteMs = 2_000
+          },
+        },
+        () => sandbox.runCommand('long job', { timeoutMs: 29_000 })
+      )
+      expect(result.providerFailure).toBe('provider_limit')
+    } finally {
+      clock.mockRestore()
+    }
+  })
+
+  it('keeps a command that reaches its own timeout near the cap a user timeout', async () => {
+    cappedPlane(CAP_MS - 50_000)
+    pause.mockRejectedValueOnce(new Error('pause unavailable'))
+    const sandbox = await e2bProvider.findSessionSandbox?.('chat', { lifetimeMs: LEASE_MS })
+    const result = await sandbox?.runCommand('short job', { timeoutMs: 1000 })
+    expect(result?.providerFailure).toBeUndefined()
+    expect(result?.timedOut).toBe(true)
   })
 })

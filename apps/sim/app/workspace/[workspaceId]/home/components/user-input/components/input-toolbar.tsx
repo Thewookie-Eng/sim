@@ -2,12 +2,17 @@
 
 import type { ReactNode, RefObject } from 'react'
 import { cn } from '@sim/emcn'
-import { ModelSelector } from '@/app/workspace/[workspaceId]/home/components/user-input/components/model-selector'
+import {
+  ModelSelector,
+  type ModelSelectorOptions,
+} from '@/app/workspace/[workspaceId]/home/components/user-input/components/model-selector'
 
 interface InputToolbarProps {
   leadingControls: ReactNode
   showModelSelector?: boolean
+  plan?: boolean
   selectionControl?: ReactNode
+  modelSelectorOptions?: ModelSelectorOptions
   voiceControl?: ReactNode
   beforeSubmitControl?: ReactNode
   submitControl?: ReactNode
@@ -22,7 +27,9 @@ interface InputToolbarProps {
 export function InputToolbar({
   leadingControls,
   showModelSelector = true,
+  plan = false,
   selectionControl,
+  modelSelectorOptions,
   voiceControl,
   beforeSubmitControl,
   submitControl,
@@ -43,7 +50,7 @@ export function InputToolbar({
       <div
         ref={leadingRef}
         className={cn(
-          'flex h-[30px] shrink-0 items-center @max-[280px]/input-toolbar:gap-0 gap-1',
+          'flex min-h-[30px] shrink-0 items-center @max-[280px]/input-toolbar:gap-0 gap-1',
           editor && 'col-start-1',
           editor && (expanded ? 'row-start-2' : 'row-start-1')
         )}
@@ -60,7 +67,7 @@ export function InputToolbar({
       <div
         ref={trailingRef}
         className={cn(
-          'ml-auto flex h-[30px] shrink-0 items-center @max-[280px]/input-toolbar:gap-0 gap-1',
+          'ml-auto flex min-h-[30px] shrink-0 items-center @max-[280px]/input-toolbar:gap-0 gap-1',
           editor && 'col-start-3',
           editor && (expanded ? 'row-start-2' : 'row-start-1')
         )}
@@ -69,7 +76,8 @@ export function InputToolbar({
           <>
             {(selectionControl || showModelSelector || voiceControl) && (
               <div className='flex items-center gap-[inherit]'>
-                {selectionControl ?? (showModelSelector && <ModelSelector />)}
+                {selectionControl ??
+                  (showModelSelector && <ModelSelector plan={plan} {...modelSelectorOptions} />)}
                 {voiceControl}
               </div>
             )}

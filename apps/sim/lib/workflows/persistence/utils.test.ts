@@ -49,7 +49,6 @@ function asAppBlocks<T>(blocks: T): Record<string, AppBlockState> {
  * These tests intentionally use old SubBlockTypes (textarea, select, messages-input, input)
  * to verify the migration logic converts them to new types.
  */
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function legacySubBlocks(subBlocks: Record<string, any>): any {
   return subBlocks
 }
@@ -816,6 +815,38 @@ describe('Database Helpers', () => {
       expect(result.deploymentVersionId).toBe('dv-admitted')
       expect(result.blocks).toEqual(state.blocks)
       expect(dbChainMockFns.where).toHaveBeenCalledTimes(1)
+    })
+
+    // `state: null` stands in for the row Postgres returns when it withholds the blob for the hinted version.
+    it('keeps withholding the active state after a by-id read of another version', async () => {
+      queueActiveVersion('dv-active', buildDeployedState())
+      await dbHelpers.loadDeployedWorkflowState('wf-hint', 'workspace-1')
+
+      queueTableRows(schemaMock.workflowDeploymentVersion, [
+        { id: 'dv-older', state: buildDeployedState() },
+      ])
+      await dbHelpers.loadWorkflowDeploymentVersionState('wf-hint', 'dv-older', 'workspace-1')
+
+      queueActiveVersion('dv-active', null)
+      const deployed = await dbHelpers.loadDeployedWorkflowState('wf-hint', 'workspace-1')
+
+      expect(deployed.deploymentVersionId).toBe('dv-active')
+      expect(mockSanitizeAgentToolsInBlocks).toHaveBeenCalledTimes(2)
+    })
+
+    it('withholds the active state again after a rollback to a version still cached', async () => {
+      queueActiveVersion('dv-a', buildDeployedState())
+      await dbHelpers.loadDeployedWorkflowState('wf-rollback', 'workspace-1')
+      queueActiveVersion('dv-b', buildDeployedState())
+      await dbHelpers.loadDeployedWorkflowState('wf-rollback', 'workspace-1')
+      queueActiveVersion('dv-a', buildDeployedState())
+      await dbHelpers.loadDeployedWorkflowState('wf-rollback', 'workspace-1')
+
+      queueActiveVersion('dv-a', null)
+      const deployed = await dbHelpers.loadDeployedWorkflowState('wf-rollback', 'workspace-1')
+
+      expect(deployed.deploymentVersionId).toBe('dv-a')
+      expect(mockSanitizeAgentToolsInBlocks).toHaveBeenCalledTimes(2)
     })
 
     it('invalidateDeployedStateCache(id) forces a rebuild on the next call', async () => {

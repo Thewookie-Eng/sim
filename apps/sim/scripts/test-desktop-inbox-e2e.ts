@@ -34,9 +34,8 @@ import {
  * real HTTP boundary: registration, the SSE doorbell, the inbox pull, claim, lease renewal and
  * completion. No chat view is open at any point.
  *
- * Start the app with the executor flag on and Redis configured, for example:
- *   MSHIP_DESKTOP_BACKGROUND_EXECUTOR=true COPILOT_TOOL_PERMISSIONS_ENABLED=true \
- *     REDIS_URL=redis://127.0.0.1:6379 bun run dev
+ * Start the app with Redis configured, which the executor needs, for example:
+ *   COPILOT_TOOL_PERMISSIONS_ENABLED=true REDIS_URL=redis://127.0.0.1:6379 bun run dev
  * then run:
  *   DESKTOP_INBOX_E2E_BASE_URL=http://127.0.0.1:3000 \
  *   DESKTOP_INBOX_E2E_DATABASE_URL=postgresql://postgres@127.0.0.1:5432/sim_test \
@@ -48,6 +47,10 @@ import {
 const logger = createLogger('DesktopInboxE2E')
 const PICKUP_GRACE_SECONDS = 15
 const RECONCILE_MS = 2_000
+/** Sim desktop gives up on a doorbell whose response has not started by then, and reconnects. */
+const DESKTOP_DOORBELL_HANDSHAKE_MS = 15_000
+/** A ring is a Redis publish and one device check away from the open stream. */
+const RING_DELIVERY_MS = 2_000
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]
@@ -149,8 +152,10 @@ async function signIn(existing?: Desktop): Promise<Desktop> {
       await tx`insert into "user" (id, name, email, normalized_email, email_verified, created_at, updated_at)
         values (${userId}, 'Desktop inbox E2E', ${email}, ${email}, true, now(), now())`
       await tx`insert into user_stats (id, user_id) values (${generateId()}, ${userId})`
-      await tx`insert into workspace (id, name, owner_id, billed_account_user_id)
-        values (${workspaceId}, 'Desktop inbox E2E', ${userId}, ${userId})`
+      await tx`insert into project (id, name, owner_id)
+        values (${workspaceId}, 'E2E fixture project', ${userId})`
+      await tx`insert into workspace (id, project_id, name, owner_id, billed_account_user_id)
+        values (${workspaceId}, ${workspaceId}, 'Desktop inbox E2E', ${userId}, ${userId})`
       await tx`insert into permissions (id, user_id, entity_type, entity_id, permission_type)
         values (${generateId()}, ${userId}, 'workspace', ${workspaceId}, 'admin')`
     }
@@ -228,16 +233,18 @@ function openDoorbell(desktop: Desktop) {
   const controller = new AbortController()
   const events: string[] = []
   const listeners = new Set<() => void>()
+  const startedAt = Date.now()
   // boundary-raw-fetch: reads the SSE doorbell as a stream.
   const opened = fetch(new URL(`/api/desktop/inbox/stream?deviceId=${desktop.deviceId}`, baseUrl), {
     headers: { Cookie: `better-auth.session_token=${desktop.cookie}`, Accept: 'text/event-stream' },
     signal: controller.signal,
   }).then(async (response) => {
+    const startedInMs = Date.now() - startedAt
     http.push({
       method: 'GET',
       path: '/api/desktop/inbox/stream',
       status: response.status,
-      durationMs: 0,
+      durationMs: startedInMs,
     })
     assert.equal(response.status, 200, `inbox stream: ${response.status}`)
     assert(response.body, 'inbox stream has no body')
@@ -265,8 +272,10 @@ function openDoorbell(desktop: Desktop) {
         }
       } catch {}
     })()
+    return startedInMs
   })
   return {
+    /** Resolves with how long the response took to start. */
     opened,
     events,
     onEvent(listener: () => void) {
@@ -284,20 +293,16 @@ function openDoorbell(desktop: Desktop) {
 function startExecutor(desktop: Desktop, doorbell: ReturnType<typeof openDoorbell>) {
   const ran = new Map<string, { toolName: string; chatId: string; executionToken: string }>()
   const completed = new Set<string>()
-  let running = false
+  let inFlight: Promise<void> | null = null
   let rerun = false
   let stopped = false
-  const pull = async () => {
-    if (running) {
-      rerun = true
-      return
-    }
-    running = true
+  const drain = async () => {
     try {
       do {
         rerun = false
         const inbox = await pullInbox(desktop)
         for (const item of inbox.items) {
+          if (stopped) return
           if (item.kind !== 'call' || ran.has(item.toolCallId)) continue
           const claimBody: ClaimDesktopToolBody = {
             deviceId: desktop.deviceId,
@@ -351,24 +356,32 @@ function startExecutor(desktop: Desktop, doorbell: ReturnType<typeof openDoorbel
         }
       } while (rerun && !stopped)
     } finally {
-      running = false
+      inFlight = null
     }
   }
-  const offDoorbell = doorbell.onEvent(
-    () => void pull().catch((error) => logger.error('pull failed', error))
-  )
-  const timer = setInterval(
-    () => void pull().catch((error) => logger.error('reconcile failed', error)),
-    RECONCILE_MS
-  )
-  void pull()
+  /** Callers that join a pull in flight share it, so its failure is logged once, here. */
+  const pull = () => {
+    if (inFlight) {
+      rerun = true
+      return
+    }
+    inFlight = drain().catch((error) => logger.error('executor pull failed', error))
+  }
+  const offDoorbell = doorbell.onEvent(pull)
+  const timer = setInterval(pull, RECONCILE_MS)
+  pull()
   return {
     ran,
     completed,
-    stop() {
+    /**
+     * Resolves once the pull in flight has settled, so the fixture is never torn down under a
+     * request the executor already started.
+     */
+    async stop() {
       stopped = true
       offDoorbell()
       clearInterval(timer)
+      await inFlight
     },
   }
 }
@@ -404,35 +417,60 @@ async function run() {
 
   await check('registers the desktop and receives the executor timing contract', async () => {
     const registration = await register(desktop)
-    assert.equal(
-      registration.enabled,
-      true,
-      'Start the app with MSHIP_DESKTOP_BACKGROUND_EXECUTOR=true'
-    )
+    assert.equal(registration.enabled, true, 'Start the app with REDIS_URL set')
     assert(registration.leaseRenewMs < registration.leaseMs)
     assert(registration.reconcileMs < PICKUP_GRACE_SECONDS * 1000)
   })
 
   /** `next dev` compiles a route on its first request, which must not count against the timed checks. */
-  await check('refuses malformed claim, lease and completion bodies', async () => {
-    for (const path of [
-      '/api/desktop/tool/claim',
-      '/api/desktop/tool/lease',
-      '/api/desktop/tool/complete',
-    ]) {
-      await request(desktop, 'POST', path, { body: {}, expected: 400 })
+  await check(
+    'reads the inbox and refuses malformed claim, lease and completion bodies',
+    async () => {
+      await pullInbox(desktop)
+      for (const path of [
+        '/api/desktop/tool/claim',
+        '/api/desktop/tool/lease',
+        '/api/desktop/tool/complete',
+      ]) {
+        await request(desktop, 'POST', path, { body: {}, expected: 400 })
+      }
     }
+  )
+
+  /**
+   * Compiles the doorbell route before its open is timed. Refused before the use case runs, so the
+   * open below is still the first to subscribe this process to the doorbell channel.
+   */
+  await check('refuses a doorbell without a device', async () => {
+    await request(desktop, 'GET', '/api/desktop/inbox/stream', { expected: 400 })
   })
 
   /** Starts absent, so only the stream open below can mark the device present. */
   await redis.del(`desktop:presence:${desktop.deviceId}`)
   const doorbell = openDoorbell(desktop)
   await check('counts the device online once it opens its doorbell stream', async () => {
-    await doorbell.opened
+    const startedInMs = await doorbell.opened
+    assert(
+      startedInMs < DESKTOP_DOORBELL_HANDSHAKE_MS,
+      `the doorbell response started after ${startedInMs} ms`
+    )
     await waitFor(
       async () => (await redis.exists(`desktop:presence:${desktop.deviceId}`)) === 1,
       10_000,
       'presence'
+    )
+  })
+
+  await check('rings the doorbell as soon as the inbox changes', async () => {
+    const heardBefore = doorbell.events.length
+    await redis.publish(
+      'desktop:inbox',
+      JSON.stringify({ deviceId: desktop.deviceId, reason: 'call' })
+    )
+    await waitFor(
+      () => doorbell.events.slice(heardBefore).includes('inbox_changed:call'),
+      RING_DELIVERY_MS,
+      'the doorbell'
     )
   })
 
@@ -544,7 +582,7 @@ async function run() {
       })
     })
   } finally {
-    executor.stop()
+    await executor.stop()
   }
 
   await check('tells the device to cancel a call whose chat was stopped', async () => {
@@ -636,8 +674,11 @@ async function cleanup() {
   if (userIds.length === 0) return
   await sql`delete from copilot_chats where user_id = any(${userIds})`
   await sql`delete from desktop_devices where user_id = any(${userIds})`
-  await sql`delete from workspace where owner_id = any(${userIds})`
-  await sql`delete from "user" where id = any(${userIds})`
+  await sql.begin(async (tx) => {
+    await tx`delete from workspace where owner_id = any(${userIds})`
+    await tx`delete from project where owner_id = any(${userIds})`
+    await tx`delete from "user" where id = any(${userIds})`
+  })
 }
 
 try {

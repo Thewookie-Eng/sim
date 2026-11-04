@@ -3,8 +3,8 @@ import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
 import { isPayloadSizeLimitError, PayloadSizeLimitError } from '@/lib/core/utils/stream-limits'
 import type { DurableSecretProvenance } from '@/lib/execution/durable-secret-provenance'
-import { prepareSandboxSessionAccess } from '@/lib/execution/remote-sandbox/execution-observer'
 import { withSandboxFilePublication } from '@/lib/execution/remote-sandbox/file-publication'
+import { prepareSandboxSessionAccess } from '@/lib/execution/remote-sandbox/observer'
 import { isSandboxOutputLimitError } from '@/lib/execution/remote-sandbox/output-limits'
 import { resolveProvider } from '@/lib/execution/remote-sandbox/provider'
 import {
@@ -62,11 +62,12 @@ export async function readSessionSandboxFile(
     await prepareSandboxSessionAccess(sessionKey, accessSignal)
     return await withSandboxSessionLock(sessionKey, accessSignal, async (signal) => {
       const provider = resolveProvider()
-      const sandbox = await provider.findSessionSandbox?.(sessionKey, {})
+      // The reconnect grants the idle lease itself, so it can reset a workbench near its runtime cap.
+      const sandbox = await provider.findSessionSandbox?.(sessionKey, {
+        lifetimeMs: SESSION_SANDBOX_IDLE_MS,
+      })
       signal.throwIfAborted()
       if (!sandbox) return { outcome: 'no-session' }
-      await sandbox.extendLifetime?.(SESSION_SANDBOX_IDLE_MS)
-      signal.throwIfAborted()
       let file: { content: string }
       try {
         file = await sandbox.readFileWithLimit(resolved, {
@@ -122,7 +123,8 @@ export async function writeSessionSandboxFile(
       const { created } = await ensureSessionSandbox({
         provider,
         kind: 'mothership',
-        options: {},
+        // A streamed transfer can outlast the idle lease; the machine must not pause mid-write.
+        options: { lifetimeMs: timeoutMs },
         selected: null,
         session: { key: sessionKey },
         signal,

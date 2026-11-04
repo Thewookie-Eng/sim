@@ -15,6 +15,7 @@ interface EnvFlagsMockState {
   isChatEnabled: boolean
   isStatusNoticePreviewEnabled: boolean
   isCopilotToolPermissionsEnabled: boolean
+  isMothershipBenchmarkEnabled: boolean
   isBillingEnabled: boolean
   isEmailVerificationEnabled: boolean
   isAuthDisabled: boolean
@@ -27,7 +28,6 @@ interface EnvFlagsMockState {
   isAppConfigEnabled: boolean
   isSlackExtendedScopesEnabled: boolean
   isTriggerDevEnabled: boolean
-  isEnterpriseEnabled: boolean
   isSsoEnabled: boolean
   isUsageMonitoringEnabled: boolean
   isAccessControlEnabled: boolean
@@ -39,6 +39,7 @@ interface EnvFlagsMockState {
   isWhitelabelingEnabled: boolean
   isAuditLogsEnabled: boolean
   isCustomBlocksEnabled: boolean
+  isCredentialGroupsEnabled: boolean
   isDataRetentionEnabled: boolean
   isDataDrainsEnabled: boolean
   isSessionPoliciesEnabled: boolean
@@ -67,6 +68,7 @@ const defaultEnvFlagsState: EnvFlagsMockState = {
   isChatEnabled: true,
   isStatusNoticePreviewEnabled: false,
   isCopilotToolPermissionsEnabled: false,
+  isMothershipBenchmarkEnabled: false,
   isBillingEnabled: false,
   isEmailVerificationEnabled: false,
   isAuthDisabled: false,
@@ -79,7 +81,6 @@ const defaultEnvFlagsState: EnvFlagsMockState = {
   isAppConfigEnabled: false,
   isSlackExtendedScopesEnabled: false,
   isTriggerDevEnabled: false,
-  isEnterpriseEnabled: false,
   isSsoEnabled: false,
   /** OAuth-aware route behavior is available unless a suite overrides it. */
   isUsageMonitoringEnabled: false,
@@ -97,6 +98,7 @@ const defaultEnvFlagsState: EnvFlagsMockState = {
   isSessionPoliciesEnabled: true,
   isAuditLogsEnabled: false,
   isCustomBlocksEnabled: false,
+  isCredentialGroupsEnabled: false,
   isDataRetentionEnabled: false,
   isDataDrainsEnabled: false,
   isForkingEnabled: false,

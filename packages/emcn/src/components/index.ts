@@ -4,6 +4,7 @@ export { Banner } from './banner/banner'
 export { BulkActionButton } from './bulk-action-button/bulk-action-button'
 export { Button } from './button/button'
 export { Checkbox, checkboxIconVariants, checkboxVariants } from './checkbox/checkbox'
+export { ChipChevronDown } from './chip/chevron'
 export {
   Chip,
   ChipLink,
@@ -12,7 +13,6 @@ export {
   chipVariants,
   TRIGGER_BORDER_CLASS,
 } from './chip/chip'
-export { ChipChevronDown } from './chip/chip-chevron'
 export {
   cellIconNodeClass,
   chipActiveSurfaceClass,
@@ -30,7 +30,7 @@ export {
   chipPrimaryFillTokens,
   chipRadiusClass,
   disclosureChevronClass,
-} from './chip/chip-chrome'
+} from './chip/chrome'
 export {
   ChipButtonGroup,
   ChipButtonGroupItem,
@@ -44,7 +44,7 @@ export {
   type ChipDropdownProps,
 } from './chip-dropdown/chip-dropdown'
 export { ChipEmailsInput } from './chip-emails-input/chip-emails-input'
-export { ChipInput, type ChipInputProps } from './chip-input/chip-input'
+export { ChipInput } from './chip-input/chip-input'
 export {
   ChipConfirmModal,
   type ChipConfirmTextSegment,
@@ -86,6 +86,7 @@ export { ComposerActionButton } from './composer-action-button/composer-action-b
 export { DetailsPanel } from './details-panel/details-panel'
 export {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuItemAction,
@@ -102,6 +103,7 @@ export {
   DropdownMenuTrigger,
   dropdownMenuRowClass,
 } from './dropdown-menu/dropdown-menu'
+export { MENU_STYLES } from './dropdown-menu/styles'
 export { Expandable, ExpandableContent } from './expandable/expandable'
 export { DashedDividerLine, FieldDivider } from './field-divider/field-divider'
 export { Info } from './info/info'
@@ -111,7 +113,6 @@ export {
   InfoCardList,
 } from './info-card/info-card'
 export { Input } from './input/input'
-export { InputOTP, InputOTPGroup, InputOTPSlot } from './input-otp/input-otp'
 export { Label } from './label/label'
 export { Lightbox } from './lightbox/lightbox'
 export {
@@ -139,6 +140,7 @@ export {
   overflowTextFadeClass,
 } from './overflow-text/overflow-text'
 export { pageHeadingClassName } from './page-heading/page-heading'
+export { POPOVER_ANIMATION_CLASSES } from './popover/animation'
 export {
   Popover,
   PopoverAnchor,
@@ -153,7 +155,6 @@ export {
   PopoverTrigger,
   usePopoverContext,
 } from './popover/popover'
-export { POPOVER_ANIMATION_CLASSES } from './popover/popover-animation'
 export { ProgressItem } from './progress-item/progress-item'
 export { RowActions, rowActionsGroupClass } from './row-actions/row-actions'
 export { SecretInput } from './secret-input/secret-input'
@@ -170,6 +171,7 @@ export {
   type StatusPageContentProps,
 } from './status-page/status-page'
 export { Switch } from './switch/switch'
+export { TabStripAction } from './tab-strip/action'
 export {
   TabStrip,
   type TabStripDragContext,
@@ -177,7 +179,6 @@ export {
   type TabStripSelectionSource,
   tabStripItemSelector,
 } from './tab-strip/tab-strip'
-export { TabStripAction } from './tab-strip/tab-strip-action'
 export {
   Table,
   TableBody,

@@ -1,5 +1,6 @@
 import { tableServiceMock, tableServiceMockFns } from '@sim/testing/mocks/table-service.mock'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { Mock } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
   collectUnresolvedReferences: vi.fn(async () => []),
@@ -22,8 +23,10 @@ import {
   NO_ENTRY_BLOCK_NOTE,
   REFERENCES_UNCHECKED_NOTE,
 } from '@/lib/workflows/editing/lint-report'
+import { getBlock } from '@/blocks/registry'
 
 const mockGetTableById = tableServiceMockFns.mockGetTableById
+const mockGetBlock = getBlock as Mock
 
 const scope = { workflowId: 'workflow-1', workspaceId: 'workspace-1', subjectUserId: 'user-1' }
 
@@ -140,6 +143,93 @@ describe('buildWorkflowLintReport notes', () => {
   })
 })
 
+/** Graphs the editor's Run button refuses before they start surface as `manualRunIssue`. */
+describe('buildWorkflowLintReport manual run', () => {
+  async function manualRunIssue(blocks: Record<string, unknown>, edges: unknown[]) {
+    return (await buildWorkflowLintReport({ blocks, edges } as never, scope)).manualRunIssue
+  }
+
+  it('reports a trigger with no outgoing connection, naming it', async () => {
+    expect(
+      await manualRunIssue(
+        { start: block('start', 'start_trigger'), agent: block('agent', 'agent') },
+        []
+      )
+    ).toEqual({
+      reason: 'trigger-not-connected',
+      message: 'start must be connected to other blocks to execute',
+      blockId: 'start',
+      blockName: 'start',
+      blockType: 'start_trigger',
+    })
+  })
+
+  it('reports a graph with no trigger a manual run can start from', async () => {
+    expect(
+      await manualRunIssue({ a: block('a', 'function'), b: block('b', 'function') }, [
+        edge('a', 'b'),
+      ])
+    ).toMatchObject({
+      reason: 'no-trigger',
+      message: 'Workflow requires at least one trigger block to execute',
+    })
+  })
+
+  it('reports a disabled trigger as no trigger', async () => {
+    expect(
+      await manualRunIssue(
+        {
+          start: { ...block('start', 'start_trigger'), enabled: false },
+          fn: block('fn', 'function'),
+        },
+        [edge('start', 'fn')]
+      )
+    ).toMatchObject({ reason: 'no-trigger' })
+  })
+
+  it('reports more than one API trigger', async () => {
+    expect(
+      await manualRunIssue(
+        {
+          api1: block('api1', 'api_trigger'),
+          api2: block('api2', 'api_trigger'),
+          fn: block('fn', 'function'),
+        },
+        [edge('api1', 'fn'), edge('api2', 'fn')]
+      )
+    ).toMatchObject({
+      reason: 'multiple-api-triggers',
+      message: 'Multiple API Trigger blocks found. Keep only one.',
+    })
+  })
+
+  it.each([
+    ['a connected Start block', 'start_trigger'],
+    ['a connected webhook trigger', 'webhook'],
+    ['a connected schedule trigger', 'schedule'],
+  ])('passes %s', async (_label, type) => {
+    expect(
+      await manualRunIssue({ t: block('t', type), fn: block('fn', 'function') }, [edge('t', 'fn')])
+    ).toBeNull()
+  })
+
+  it('passes a legacy starter without connections, which a manual run accepts', async () => {
+    expect(await manualRunIssue({ start: block('start', 'starter') }, [])).toBeNull()
+  })
+
+  it('passes a chat-only workflow, which runs from chat rather than the Run button', async () => {
+    expect(
+      await manualRunIssue({ chat: block('chat', 'chat_trigger'), fn: block('fn', 'function') }, [
+        edge('chat', 'fn'),
+      ])
+    ).toBeNull()
+  })
+
+  it('leaves an empty graph to its own note', async () => {
+    expect(await manualRunIssue({}, [])).toBeNull()
+  })
+})
+
 /**
  * The report builder is the one place with database access, so it resolves
  * each Table block's filter and sort fields against the bound table's live
@@ -216,5 +306,49 @@ describe('buildWorkflowLintReport table fields', () => {
     await expect(buildWorkflowLintReport(graph, scope, { requireComplete: true })).rejects.toThrow(
       'Workflow table schema checks could not complete'
     )
+  })
+})
+
+describe('buildWorkflowLintReport JSON fields', () => {
+  const registryStub = mockGetBlock.getMockImplementation()
+
+  beforeEach(() => {
+    mockGetBlock.mockImplementation((type: string) =>
+      type === 'table_v2'
+        ? { type, subBlocks: [{ id: 'data', type: 'code', language: 'json' }], outputs: {} }
+        : { type, category: 'triggers', subBlocks: [], outputs: {} }
+    )
+  })
+
+  afterEach(() => {
+    mockGetBlock.mockImplementation(registryStub ?? (() => undefined))
+  })
+
+  /**
+   * An unquoted string reference in Table row JSON reported nothing anywhere
+   * before run time, so a deploy went live with a block that failed on every run.
+   */
+  it('reports a string reference written unquoted in a JSON field, whoever the caller is', async () => {
+    const start = {
+      ...block('start', 'start_trigger'),
+      subBlocks: { inputFormat: { value: [{ name: 'order_id', type: 'string' }] } },
+    }
+    const insert = {
+      ...block('insert', 'table_v2'),
+      subBlocks: { data: { value: '{"order_id": <start.order_id>}' } },
+    }
+    const report = await buildWorkflowLintReport(
+      { blocks: { start, insert }, edges: [edge('start', 'insert')] } as never,
+      { ...scope, subjectUserId: null }
+    )
+
+    expect(report.unresolvedReferences).toEqual([
+      expect.objectContaining({
+        blockId: 'insert',
+        field: 'data',
+        kind: 'block-output',
+        value: ['<start.order_id>'],
+      }),
+    ])
   })
 })

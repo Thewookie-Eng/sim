@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util'
 import {
   BROWSER_TOOL_AUTHORIZATION_TIMEOUT_MS,
   type BrowserPanelAction,
@@ -9,6 +10,8 @@ import {
   isCurrentBrowserToolName,
 } from '@sim/browser-protocol'
 import {
+  ComputerUseError,
+  type ComputerUseToolFailure,
   type DesktopExecutorDevice,
   type DesktopNotificationPayload,
   type DesktopServerChangeResult,
@@ -33,6 +36,10 @@ import { PASTE_LIMITS, utf8ByteLength } from '@sim/utils/paste'
 import type { BrowserWindow, IpcMainEvent, IpcMainInvokeEvent, WebContents } from 'electron'
 import { clipboard, ipcMain, shell } from 'electron'
 import {
+  captureAccountDataGeneration,
+  isAccountDataGenerationCurrent,
+} from '@/main/account-data-generation'
+import {
   type BrowserToolQueueBoundary,
   cancelActiveTool,
   cancelTool,
@@ -50,6 +57,7 @@ import {
 } from '@/main/browser-agent/driver'
 import { isAgentWebContents } from '@/main/browser-agent/registry'
 import {
+  activeTab,
   addTab,
   findInActiveTab,
   focusPageForUser,
@@ -72,19 +80,26 @@ import {
   revealCredential,
 } from '@/main/browser-credentials'
 import {
+  bringSignInBack,
+  cancelSignIn,
+  continueSignIn,
+  getPendingSignIn,
   importChromeCookies,
   importChromeData,
   importChromePasswords,
   listChromeImportProfiles,
+  migrateSignIn,
 } from '@/main/browser-import'
 import { getSearchSuggestions } from '@/main/browser-search/suggestions'
 import { listSites } from '@/main/browser-sites'
+import type { ComputerUseService } from '@/main/computer-use/service'
 import { isSafeInternalPath } from '@/main/config'
 import type { DesktopSettingsService } from '@/main/desktop-settings'
 import { isDesktopPreferenceKey } from '@/main/desktop-settings'
 import { hasRecentDeliberateInput, hasRecentDiscreteInput } from '@/main/input-activity'
+import type { LocalFilePermissions } from '@/main/local-file-permissions'
 import { executeLocalFileRequest } from '@/main/local-files'
-import type { LocalFilesystemService } from '@/main/local-filesystem'
+import type { LocalFileAccess, LocalFilesystemService } from '@/main/local-filesystem'
 import { isAppOrigin, openExternalSafe } from '@/main/navigation'
 import type { ScopedEventRouter } from '@/main/scoped-event-router'
 import type { TerminalRegistry } from '@/main/terminal/registry'
@@ -305,10 +320,11 @@ export function parseDesktopNotificationPayload(raw: unknown): DesktopNotificati
   if (typeof raw !== 'object' || raw === null) {
     return null
   }
-  const { title, body, route } = raw as {
+  const { title, body, route, background } = raw as {
     title?: unknown
     body?: unknown
     route?: unknown
+    background?: unknown
   }
   if (
     typeof title !== 'string' ||
@@ -323,10 +339,16 @@ export function parseDesktopNotificationPayload(raw: unknown): DesktopNotificati
   if (route !== undefined && (typeof route !== 'string' || !isSafeInternalPath(route))) {
     return null
   }
-  return { title, body, ...(route !== undefined ? { route } : {}) }
+  return {
+    title,
+    body,
+    ...(route !== undefined ? { route } : {}),
+    ...(background === true ? { background: true } : {}),
+  }
 }
 
 export interface IpcDeps {
+  computerUse?: ComputerUseService
   /**
    * The Sim origin a renderer belongs to. Windows of different accounts can
    * point at different servers, so the gate asks per sender; without one it
@@ -343,6 +365,8 @@ export interface IpcDeps {
   retryLoad: (sender: WebContents) => void
   /** Folder grants are given to one account's agent, so each renderer sees its account's. */
   localFilesystemFor: (sender: WebContents) => LocalFilesystemService
+  /** The folder-permission prompts for the sender's account's grants. */
+  localFilePermissionsFor: (sender: WebContents) => LocalFilePermissions
   /** Brings the sender's account's window to a route; what a notification click does. */
   openRouteForSender: (sender: WebContents, route?: string) => void
   terminal: TerminalRegistry
@@ -383,7 +407,7 @@ export interface IpcDeps {
   updates: {
     getState: () => DesktopUpdateState
     check: () => void
-    install: () => void
+    install: (options: { mandatory: boolean }) => void
   }
   server: {
     open: () => void
@@ -532,13 +556,14 @@ async function fetchDesktopToolAuthorization(
   deps: IpcDeps,
   toolCallId: unknown,
   claim = false,
-  onFailureStatus?: (status: number) => void
+  onFailureStatus?: (status: number) => void,
+  authorizationPath = '/api/desktop/tool/authorize'
 ): Promise<DesktopToolAuthorization | null> {
   if (!isDesktopToolCallId(toolCallId)) return null
   const startedAt = Date.now()
   try {
     const response = await event.sender.session.fetch(
-      `${deps.appOrigin(event.sender)}/api/desktop/tool/authorize`,
+      `${deps.appOrigin(event.sender)}${authorizationPath}`,
       {
         method: 'POST',
         credentials: 'include',
@@ -616,6 +641,8 @@ async function authorizeLocalFilesystemTool(
  * unvalidated args they must parse themselves.
  */
 export function registerIpcHandlers(deps: IpcDeps): void {
+  const activeLocalFiles = new Map<string, Set<AbortController>>()
+  let activeLocalFileCount = 0
   const browserScopeBySender = new WeakMap<WebContents, string>()
   const terminalScopeBySender = new WeakMap<WebContents, string>()
   const browserPendingScopesBySender = new WeakMap<WebContents, Set<string>>()
@@ -707,6 +734,84 @@ export function registerIpcHandlers(deps: IpcDeps): void {
   }
 
   const channels: Record<string, ChannelSpec> = {
+    'computer-use:get-activity': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requiresAccountData: true,
+      denied: null,
+      handler: () => deps.computerUse?.getActivity() ?? null,
+    },
+    'computer-use:status': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requiresAccountData: true,
+      denied: null,
+      handler: () => deps.computerUse?.getStatus(),
+    },
+    'computer-use:set-enabled': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requiresAccountData: true,
+      needsUserActivation: true,
+      denied: null,
+      handler: (enabled) => {
+        if (typeof enabled !== 'boolean')
+          throw new Error('A boolean Computer Use preference is required.')
+        return deps.computerUse?.setEnabled(enabled)
+      },
+    },
+    'computer-use:request-permission': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requiresAccountData: true,
+      needsUserActivation: true,
+      denied: null,
+      handler: (permission) => {
+        if (permission !== 'accessibility' && permission !== 'screenCapture')
+          throw new Error('Unknown Computer Use permission.')
+        return deps.computerUse?.requestPermission(permission)
+      },
+    },
+    'computer-use:list-permissions': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requiresAccountData: true,
+      denied: [],
+      handler: () => deps.computerUse?.listAppPermissions() ?? [],
+    },
+    'computer-use:revoke-app': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requiresAccountData: true,
+      needsUserActivation: true,
+      denied: undefined,
+      handler: (bundleId) => {
+        if (typeof bundleId !== 'string' || bundleId.length > 255)
+          throw new Error('Invalid app identifier.')
+        deps.computerUse?.revokeApp(bundleId)
+      },
+    },
+    'computer-use:cancel': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      denied: undefined,
+      handler: (toolCallId) => {
+        if (toolCallId !== undefined && !isDesktopToolCallId(toolCallId))
+          throw new Error('Invalid tool call identifier.')
+        deps.computerUse?.cancel(toolCallId)
+      },
+    },
+    'computer-use:execute-tool': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requiresAccountData: true,
+      denied: undefined,
+      handler: (scopeId, toolCallId, params) => {
+        if (!deps.computerUse || typeof scopeId !== 'string' || typeof toolCallId !== 'string')
+          throw new Error('Computer Use is unavailable.')
+        return deps.computerUse.execute(toolCallId, scopeId, params)
+      },
+    },
     'desktop:open-external': {
       kind: 'invoke',
       gate: 'any',
@@ -781,8 +886,12 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       requiresAccountData: true,
       passSender: true,
       denied: { ok: false, error: 'Local file tools are unavailable from this page.' },
-      handler: (_sender, request, authorization) =>
-        executeLocalFileRequest(request, authorization as DesktopToolAuthorization),
+      handler: (_sender, request, authorization, access) =>
+        executeLocalFileRequest(
+          request,
+          authorization as DesktopToolAuthorization,
+          access as LocalFileAccess
+        ),
     },
     'desktop:local-filesystem': {
       kind: 'invoke',
@@ -825,6 +934,26 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       handler: (enabled) =>
         typeof enabled === 'boolean'
           ? deps.settings.setBrowserSearchSuggestionsEnabled(enabled)
+          : deps.settings.getPreferences(),
+    },
+    'desktop:settings:set-full-file-access': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      needsUserActivation: true,
+      requiresAccountData: true,
+      denied: null,
+      handler: (enabled) =>
+        typeof enabled === 'boolean'
+          ? deps.settings.setFullFileAccess(enabled)
+          : deps.settings.getPreferences(),
+    },
+    'desktop:settings:set-prevent-sleep': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      denied: null,
+      handler: (enabled) =>
+        typeof enabled === 'boolean'
+          ? deps.settings.setPreventSleepWhileRunning(enabled)
           : deps.settings.getPreferences(),
     },
     'desktop:settings:set-appearance': {
@@ -925,7 +1054,8 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       kind: 'send',
       gate: 'app-origin',
       needsUserActivation: true,
-      handler: () => deps.updates.install(),
+      handler: (options) =>
+        deps.updates.install({ mandatory: isRecordLike(options) && options.mandatory === true }),
     },
     'browser-agent:execute-tool': {
       kind: 'invoke',
@@ -1086,6 +1216,7 @@ export function registerIpcHandlers(deps: IpcDeps): void {
           return { tabs: [], activeTabId: null }
         }
         consumePendingScope(browserPendingScopesBySender, contents, from)
+        migrateSignIn(from, to)
         if (browserScopeBySender.get(contents) === from) {
           browserScopeBySender.set(contents, to)
           deps.scopeEvents.activateBrowser(contents, to)
@@ -1222,6 +1353,9 @@ export function registerIpcHandlers(deps: IpcDeps): void {
       needsUserActivation: ([action]) => {
         if (!isRecordLike(action)) return false
         if (action.action === 'navigate') return true
+        if (action.action === 'respond-prompt') {
+          return isRecordLike(action.response) && action.response.allowed === true
+        }
         return action.action === 'respond-media-permission' && action.allowed === true
       },
       handler: (sender, action, rawScope) => {
@@ -1420,6 +1554,79 @@ export function registerIpcHandlers(deps: IpcDeps): void {
           typeof profileId === 'string' ? profileId : undefined,
           policy === 'replace' ? 'replace' : 'keep-existing'
         )
+      },
+    },
+    // Continue a sign-in in the user's own browser (see the bridge's
+    // `continueSignIn`). The shell reads the address from the tab, never from
+    // the renderer; Sim's own pages ride the app session, so they are refused.
+    'browser-import:continue-sign-in': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requires: 'browser',
+      passSender: true,
+      needsUserActivation: true,
+      denied: { error: 'unknown' },
+      handler: (sender, profileId, rawScope) => {
+        const scopeId = activeRendererScope(browserScopeBySender, sender as WebContents, rawScope)
+        if (!scopeId || typeof profileId !== 'string') return { error: 'unknown' }
+        const tab = withBrowserScope(scopeId, () => activeTab())
+        const url = tab?.view.webContents.getURL() ?? ''
+        if (!tab || isAppOrigin(url, deps.appOrigin(sender as WebContents)))
+          return { error: 'unsupported-page' }
+        return continueSignIn(scopeId, { profileId, tabId: tab.id, url })
+      },
+    },
+    // Imports the chat's pending sign-in, then reopens the handed-off page
+    // through the omnibox's navigation path, or in a new tab if it was closed.
+    'browser-import:bring-sign-in-back': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requires: 'browser',
+      passSender: true,
+      needsUserActivation: true,
+      denied: { cookiesImported: 0, cookiesSkipped: 0, error: 'unknown' },
+      handler: async (sender, rawScope) => {
+        const scopeId = activeRendererScope(browserScopeBySender, sender as WebContents, rawScope)
+        if (!scopeId) return { cookiesImported: 0, cookiesSkipped: 0, error: 'unknown' }
+        const { result, handoff, current } = await bringSignInBack(scopeId)
+        if (!handoff || !current || result.cookiesImported === 0) return result
+        const tabOpen = withBrowserScope(scopeId, () =>
+          peekTabsState().tabs.some(({ tabId }) => tabId === handoff.tabId)
+        )
+        if (!tabOpen) {
+          withBrowserScope(scopeId, () => {
+            const tab = addTab()
+            void tab.view.webContents.loadURL(handoff.url).catch(() => {})
+            focusPageForUser(tab.view.webContents)
+          })
+          return result
+        }
+        await handlePanelAction(scopeId, { action: 'switch-tab', tabId: handoff.tabId })
+          .then(() => handlePanelAction(scopeId, { action: 'navigate', url: handoff.url }))
+          .catch(() => {})
+        return result
+      },
+    },
+    'browser-import:cancel-sign-in': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requires: 'browser',
+      passSender: true,
+      denied: undefined,
+      handler: (sender, rawScope) => {
+        const scopeId = activeRendererScope(browserScopeBySender, sender as WebContents, rawScope)
+        if (scopeId) cancelSignIn(scopeId)
+      },
+    },
+    'browser-import:pending-sign-in': {
+      kind: 'invoke',
+      gate: 'app-origin',
+      requires: 'browser',
+      passSender: true,
+      denied: null,
+      handler: (sender, rawScope) => {
+        const scopeId = activeRendererScope(browserScopeBySender, sender as WebContents, rawScope)
+        return scopeId ? getPendingSignIn(scopeId) : null
       },
     },
     // Reported by the browser preload for the page it is running in. The
@@ -2064,6 +2271,59 @@ export function registerIpcHandlers(deps: IpcDeps): void {
           return spec.denied
         }
         let handlerArgs = args
+        if (channel === 'computer-use:execute-tool') {
+          if (!deps.computerUse?.isEnabled())
+            throw new Error('Computer Use is switched off on this Mac.')
+          const toolCallId = args[0]
+          if (!isDesktopToolCallId(toolCallId)) throw new Error('Invalid tool call identifier.')
+          const computerUse = deps.computerUse
+          let ownerEnded = false
+          const cancelOwnedTool = (): void => {
+            if (ownerEnded) return
+            ownerEnded = true
+            computerUse.cancel(toolCallId)
+          }
+          const onNavigation = (
+            _event: unknown,
+            _url: string,
+            isInPlace: boolean,
+            isMainFrame: boolean
+          ): void => {
+            if (!isInPlace && isMainFrame) cancelOwnedTool()
+          }
+          /** A crashed renderer cannot send pagehide or Stop; main owns the action lifetime. */
+          event.sender.on('destroyed', cancelOwnedTool)
+          event.sender.on('render-process-gone', cancelOwnedTool)
+          event.sender.on('did-start-navigation', onNavigation)
+          try {
+            if (event.sender.isDestroyed()) throw new Error('Computer Use session ended.')
+            return await computerUse.executeAuthorized(toolCallId, async () => {
+              const authorization = await fetchDesktopToolAuthorization(
+                event,
+                deps,
+                toolCallId,
+                false,
+                undefined,
+                '/api/desktop/computer/authorize'
+              )
+              if (!authorization || authorization.toolName !== 'computer') {
+                throw new Error('This is not an authorized pending Computer Use action.')
+              }
+              if (!senderAllowed(event, spec.gate) || !deps.accountDataAvailable())
+                throw new Error('Computer Use session ended.')
+              return { scopeId: authorization.chatId, input: authorization.args }
+            })
+          } catch (error) {
+            /** Electron drops custom Error properties; keep native dispatch certainty in data. */
+            if (error instanceof ComputerUseError)
+              return { kind: 'error', error: error.details } satisfies ComputerUseToolFailure
+            throw error
+          } finally {
+            event.sender.removeListener('destroyed', cancelOwnedTool)
+            event.sender.removeListener('render-process-gone', cancelOwnedTool)
+            event.sender.removeListener('did-start-navigation', onNavigation)
+          }
+        }
         if (channel === 'browser-agent:execute-tool') {
           const toolCallId = args[0]
           const requestedTool = args[1]
@@ -2149,30 +2409,83 @@ export function registerIpcHandlers(deps: IpcDeps): void {
           }
         }
         if (channel === 'desktop:local-files') {
+          const generation = captureAccountDataGeneration()
+          const origin = deps.appOrigin(event.sender)
           const request = args[0]
-          if (!isRecordLike(request)) return { ok: false, error: 'Invalid local file request.' }
-          let failureStatus: number | undefined
-          const authorization = await fetchDesktopToolAuthorization(
-            event,
-            deps,
-            request.toolCallId,
-            request.operation === 'manifest' || request.operation === 'read',
-            (status) => {
-              failureStatus = status
-            }
-          )
-          if (failureStatus === 409)
+          if (!isRecordLike(request) || !isDesktopToolCallId(request.toolCallId))
+            return { ok: false, error: 'Invalid local file request.' }
+          const key = JSON.stringify([event.sender.id, request.toolCallId])
+          if (request.operation === 'cancel') {
+            for (const pending of activeLocalFiles.get(key) ?? []) pending.abort()
+            return { ok: false, error: 'Local file operation cancelled.' }
+          }
+          if (activeLocalFileCount >= 128)
             return {
               ok: false,
-              code: 'ALREADY_STARTED',
-              error: 'This import is already running or was already started.',
+              error: 'Too many local file operations are running. Try again later.',
             }
-          if (
-            !authorization ||
-            !['read_local_file', 'import_local_files'].includes(authorization.toolName)
-          )
-            return { ok: false, error: 'This is not an authorized pending local file tool call.' }
-          handlerArgs = [request, authorization]
+          const controller = new AbortController()
+          const controllers = activeLocalFiles.get(key) ?? new Set<AbortController>()
+          controllers.add(controller)
+          activeLocalFiles.set(key, controllers)
+          activeLocalFileCount++
+          try {
+            let failureStatus: number | undefined
+            const authorization = await fetchDesktopToolAuthorization(
+              event,
+              deps,
+              request.toolCallId,
+              request.operation === 'manifest' || request.operation === 'read',
+              (status) => {
+                failureStatus = status
+              }
+            )
+            if (failureStatus === 409)
+              return {
+                ok: false,
+                code: 'ALREADY_STARTED',
+                error: 'This import is already running or was already started.',
+              }
+            if (
+              !authorization ||
+              !['read_local_file', 'import_local_files'].includes(authorization.toolName)
+            )
+              return { ok: false, error: 'This is not an authorized pending local file tool call.' }
+            if (
+              authorization.toolName === 'read_local_file'
+                ? request.operation !== 'read'
+                : request.operation !== 'manifest' && request.operation !== 'chunk'
+            )
+              return { ok: false, error: 'The operation does not match the pending tool call.' }
+            const parent = deps.getWindowForContents(event.sender)
+            if (!parent)
+              return { ok: false, error: 'A desktop window is required to approve file access.' }
+            const access = await deps
+              .localFilePermissionsFor(event.sender)
+              .authorize(authorization, {
+                parent: async () => parent,
+                origin,
+                generation,
+                signal: controller.signal,
+                isCurrent: () =>
+                  isAccountDataGenerationCurrent(generation) &&
+                  deps.accountDataAvailable() &&
+                  deps.appOrigin(event.sender) === origin &&
+                  isAppOriginSender(event, origin),
+                revalidate: async () =>
+                  isDeepStrictEqual(
+                    authorization,
+                    await fetchDesktopToolAuthorization(event, deps, request.toolCallId)
+                  ),
+              })
+            return await spec.handler(event.sender, request, authorization, access)
+          } catch (error) {
+            return { ok: false, error: getErrorMessage(error) }
+          } finally {
+            controllers.delete(controller)
+            if (controllers.size === 0) activeLocalFiles.delete(key)
+            activeLocalFileCount--
+          }
         }
         if (spec.passSender) {
           handlerArgs = [event.sender, ...handlerArgs]

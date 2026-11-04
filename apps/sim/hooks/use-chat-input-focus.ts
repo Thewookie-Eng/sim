@@ -1,4 +1,7 @@
-import { type RefObject, useEffect } from 'react'
+import { createContext, type RefObject, useContext, useEffect, useImperativeHandle } from 'react'
+import { isMobileViewport } from '@/hooks/use-is-mobile'
+
+export const ChatInputFocusContext = createContext<RefObject<(() => void) | null> | null>(null)
 
 interface UseChatInputFocusProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>
@@ -6,9 +9,17 @@ interface UseChatInputFocusProps {
 
 /** Focuses a newly opened chat without interrupting typing elsewhere or an inactive window. */
 export function useChatInputFocus({ textareaRef }: UseChatInputFocusProps) {
+  const requestedFocus = useContext(ChatInputFocusContext)
+  useImperativeHandle(
+    requestedFocus,
+    () => () => {
+      if (!document.querySelector('[role="dialog"], dialog[open]')) textareaRef.current?.focus()
+    },
+    [textareaRef]
+  )
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
-      if (!document.hasFocus()) return
+      if (isMobileViewport() || !document.hasFocus()) return
       const active = document.activeElement
       if (
         active instanceof HTMLElement &&

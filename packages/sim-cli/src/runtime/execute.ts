@@ -8,11 +8,11 @@ import {
   waitWorkspaceOperation,
   workspaceWaitTimeout,
 } from '../commands/protocol/workspace-operation-wait'
-import { clientFrom } from '../context'
 import type { CommandSpec } from '../contract/types'
 import type { GetWorkspaceOperationResponse, V2OperationName } from '../generated/v2-api'
 import { assertCursorAdvances, pageProgress, SimApiError, type V2Page } from '../http/client'
 import { safeOneLine } from '../output/render'
+import { connect } from './called-operations'
 import { camel } from './derive'
 import { DEFAULT_PAGE_SIZE, defaultListLimit } from './options'
 import { warnRenamedFlag } from './renamed'
@@ -21,7 +21,9 @@ import {
   cursorSlot,
   flagNameFor,
   isProfileWorkspacePath,
+  otherSpellings,
   PROFILE_INJECTED_FIELD,
+  trailingListField,
 } from './request'
 import { foldPageEnvelope, renderPage, renderResult } from './result'
 import type { OperationSpec } from './types'
@@ -130,6 +132,13 @@ export const BULK_OUTCOME_CHECKS: Readonly<Partial<Record<V2OperationName, BulkO
     const requested = lengthOf(body?.fileIds)
     if (requested === 0) return null
     return `Deleted nothing: none of the ${requested} requested ${requested === 1 ? 'file was' : 'files were'} deleted.`
+  },
+  archiveProjectFileItems: (payload, body) => {
+    const items = payload.deletedItems as { files?: unknown; folders?: unknown } | undefined
+    if (countOf(items?.files) + countOf(items?.folders) > 0) return null
+    const requested = lengthOf(body?.fileIds) + lengthOf(body?.folderIds)
+    if (requested === 0) return null
+    return `Archived nothing: none of the ${requested} requested ${requested === 1 ? 'item was' : 'items were'} archived.`
   },
   /**
    * `added` empty with `failed` populated is a call that indexed nothing. An
@@ -351,35 +360,34 @@ function assertSelectorIsUsable(operation: V2OperationName, flags: Record<string
 }
 
 /**
- * Moves a value supplied under a flag's former name onto its current one.
+ * Moves a value supplied under a flag's former name or hidden alias onto its
+ * documented one.
  *
  * Done here rather than in `buildRequest` because this is where the parsed
  * flags are assembled and still keyed by what the caller typed; by the time the
  * request is built, only the current spelling has meaning.
  *
- * Supplying both spellings is refused rather than resolved. They are the same
+ * Supplying two spellings is refused rather than resolved. They are the same
  * field, so a caller who sets both has two different values in mind and no
- * reading of "the new one wins" is more likely to be the intended one.
+ * reading of "the documented one wins" is more likely to be the intended one.
  */
-function foldRenamedFlags(
+function foldOtherSpellings(
   operation: V2OperationName,
   commandSpec: CommandSpec,
   flags: Record<string, unknown>
 ): void {
   for (const [field, flag] of Object.entries(commandSpec.flags ?? {})) {
-    if (!flag.renamedFrom?.length) continue
-
     const current = flagNameFor(operation, field)
-    for (const previous of flag.renamedFrom) {
-      const supplied = flags[camel(previous)]
+    for (const { name, renamed } of otherSpellings(flag)) {
+      const supplied = flags[camel(name)]
       if (supplied === undefined) continue
       if (flags[camel(current)] !== undefined) {
         throw new SimApiError(
-          `--${previous} is the former name of --${current}; pass one, not both`,
+          `--${name} is ${renamed ? 'the former name' : 'another spelling'} of --${current}; pass one, not both`,
           0
         )
       }
-      warnRenamedFlag(previous, current)
+      if (renamed) warnRenamedFlag(name, current)
       flags[camel(current)] = supplied
     }
   }
@@ -409,8 +417,19 @@ export async function executeOperation(
   for (const [index, field] of (commandSpec.positionals ?? []).entries()) {
     requestFlags[camel(flagNameFor(operation, field))] = invocation[pathPositionalCount + index]
   }
+  const trailing = trailingListField(commandSpec)
+  const trailingValues = trailing
+    ? invocation[pathPositionalCount + (commandSpec.positionals?.length ?? 0)]
+    : undefined
+  if (trailing && Array.isArray(trailingValues) && trailingValues.length > 0) {
+    const name = flagNameFor(operation, trailing)
+    if (requestFlags[camel(name)] !== undefined) {
+      throw new SimApiError(`Pass the ${name} as arguments or with --${name}, not both`, 0)
+    }
+    requestFlags[camel(name)] = trailingValues
+  }
 
-  foldRenamedFlags(operation, commandSpec, requestFlags)
+  foldOtherSpellings(operation, commandSpec, requestFlags)
   assertCapIsUsable(operation, requestFlags)
   assertSelectorIsUsable(operation, requestFlags)
 
@@ -432,7 +451,7 @@ export async function executeOperation(
     throw new SimApiError('--all-workspaces cannot be combined with --workspace', 0)
   }
 
-  const { client, profile } = clientFrom(host)
+  const { client, profile } = connect(host)
   const hasWorkspaceField = Boolean(
     (operationSpec.query && PROFILE_INJECTED_FIELD in operationSpec.query) ||
       (operationSpec.body && PROFILE_INJECTED_FIELD in operationSpec.body)
@@ -499,8 +518,8 @@ export async function executeOperation(
       do {
         const pageSize = Math.min(DEFAULT_PAGE_SIZE, limit - rows.length)
         const pageLimit = 'limit' in (operationSpec[paging] ?? {}) ? { limit: pageSize } : {}
-        const page: V2Page<unknown> = await client.request(request.path, {
-          method: operationSpec.method,
+        const page: V2Page<unknown> = await client.request(operation, {
+          params: request.params,
           headers: request.headers,
           query: paging === 'query' ? { ...request.query, ...pageLimit, cursor } : request.query,
           body:
@@ -529,8 +548,8 @@ export async function executeOperation(
 
   let result: { data?: unknown }
   try {
-    result = await client.request<{ data?: unknown }>(request.path, {
-      method: operationSpec.method,
+    result = await client.request<{ data?: unknown }>(operation, {
+      params: request.params,
       headers: request.headers,
       query: request.query,
       body: request.body,

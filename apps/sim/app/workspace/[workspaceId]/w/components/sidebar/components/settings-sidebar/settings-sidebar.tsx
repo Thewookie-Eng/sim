@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Chip,
-  ChipConfirmModal,
   ChipTag,
   chipContentIconClass,
   chipVariants,
@@ -25,7 +24,7 @@ import {
 import { SettingsIntentLink } from '@/components/settings/settings-intent-link'
 import { useSettingsNavigationState } from '@/components/settings/settings-navigation-provider'
 import { usePendingSettingsSelection } from '@/components/settings/use-pending-settings-selection'
-import { useSession } from '@/lib/auth/auth-client'
+import { useSession } from '@/lib/auth/client'
 import { getSubscriptionAccessState } from '@/lib/billing/client'
 import { canViewWorkspaceBillingSettings } from '@/lib/billing/workspace-permissions'
 import { useDeploymentShape } from '@/lib/core/config/deployment-shape'
@@ -73,10 +72,6 @@ export function SettingsSidebar({
   const router = useRouter()
 
   const requestLeave = useSettingsDirtyStore((s) => s.requestLeave)
-  const confirmLeave = useSettingsDirtyStore((s) => s.confirmLeave)
-  const cancelLeave = useSettingsDirtyStore((s) => s.cancelLeave)
-  const pendingLeave = useSettingsDirtyStore((s) => s.pendingLeave)
-  const showDiscardDialog = pendingLeave !== null
 
   const scrollEdges = useScrollEdges(scrollContainerRef, {
     contentRef: scrollContentRef,
@@ -100,7 +95,7 @@ export function SettingsSidebar({
 
   const { config: permissionConfig } = usePermissionConfig()
   const accessRequests = useWorkspaceAccessRequestFeatures()
-  const accessRequestsEnabled = accessRequests.data?.enabled === true
+  const requestableFeatureKeys = accessRequests.requestableFeatureKeys
   const forkingAvailable = useForkingAvailable(workspaceId)
   const { workspacePermissions, userPermissions } = useWorkspacePermissionsContext()
   // The server-seeded viewer permission, read directly: the derived admin flag waits on the client
@@ -173,26 +168,46 @@ export function SettingsSidebar({
         return false
       }
 
-      if (item.id === 'secrets' && permissionConfig.hideSecretsTab && !accessRequestsEnabled) {
+      if (
+        item.id === 'secrets' &&
+        permissionConfig.hideSecretsTab &&
+        !requestableFeatureKeys.has('hideSecretsTab')
+      ) {
         return false
       }
-      if (item.id === 'apikeys' && permissionConfig.hideApiKeysTab && !accessRequestsEnabled) {
+      if (
+        item.id === 'apikeys' &&
+        permissionConfig.hideApiKeysTab &&
+        !requestableFeatureKeys.has('hideApiKeysTab')
+      ) {
         return false
       }
-      if (item.id === 'inbox' && permissionConfig.hideInboxTab && !accessRequestsEnabled) {
+      if (
+        item.id === 'inbox' &&
+        permissionConfig.hideInboxTab &&
+        !requestableFeatureKeys.has('hideInboxTab')
+      ) {
         return false
       }
-      if (item.id === 'mcp' && permissionConfig.disableMcpTools && !accessRequestsEnabled) {
+      if (
+        item.id === 'mcp' &&
+        permissionConfig.disableMcpTools &&
+        !requestableFeatureKeys.has('disableMcpTools')
+      ) {
         return false
       }
       if (
         item.id === 'custom-tools' &&
         permissionConfig.disableCustomTools &&
-        !accessRequestsEnabled
+        !requestableFeatureKeys.has('disableCustomTools')
       ) {
         return false
       }
-      if (item.id === 'sandboxes' && permissionConfig.hideSandboxesTab && !accessRequestsEnabled) {
+      if (
+        item.id === 'sandboxes' &&
+        permissionConfig.hideSandboxesTab &&
+        !requestableFeatureKeys.has('hideSandboxesTab')
+      ) {
         return false
       }
       if (item.id === 'forks' && !(forkingAvailable && canAdminWorkspace)) {
@@ -263,7 +278,7 @@ export function SettingsSidebar({
     isSSOProviderOwner,
     ssoProvidersData?.providers?.length,
     permissionConfig,
-    accessRequestsEnabled,
+    requestableFeatureKeys,
     isSuperUser,
     generalSettings?.superUserModeEnabled,
     forkingAvailable,
@@ -287,14 +302,6 @@ export function SettingsSidebar({
       router.push(popSettingsReturnUrl(`/workspace/${workspaceId}`))
     })
   }, [requestLeave, router, popSettingsReturnUrl, workspaceId])
-
-  const handleConfirmDiscard = useCallback(() => {
-    confirmLeave()
-  }, [confirmLeave])
-
-  const handleCancelDiscard = useCallback(() => {
-    cancelLeave()
-  }, [cancelLeave])
 
   useEffect(() => {
     setDesktopSurfaces({
@@ -364,10 +371,12 @@ export function SettingsSidebar({
                   {key === 'organization' && organizationSettingsId && (
                     <SidebarTooltip label='Organization' enabled={showCollapsedTooltips}>
                       <SettingsIntentLink
+                        data-settings-navigation='managed'
                         href={getOrganizationSettingsHref(organizationSettingsId, 'members')}
                         className={cn(chipVariants({ fullWidth: true }), SIDEBAR_RAIL_CHIP_CLASS)}
                         onNavigate={(event) => {
-                          if (!useSettingsDirtyStore.getState().isDirty) return
+                          const { isDirty, navigationBlocked } = useSettingsDirtyStore.getState()
+                          if (!isDirty && !navigationBlocked) return
                           event.preventDefault()
                           requestLeave(() =>
                             router.push(
@@ -446,6 +455,7 @@ export function SettingsSidebar({
                       </a>
                     ) : (
                       <SettingsIntentLink
+                        data-settings-navigation='managed'
                         href={href}
                         replace
                         scroll={false}
@@ -461,10 +471,6 @@ export function SettingsSidebar({
                             return
                           }
                           event.preventDefault()
-                          if (!useSettingsDirtyStore.getState().isDirty) {
-                            navigateToSection(section, href)
-                            return
-                          }
                           requestLeave(() => navigateToSection(section, href))
                         }}
                       >
@@ -487,19 +493,6 @@ export function SettingsSidebar({
             ))}
         </div>
       </div>
-
-      <ChipConfirmModal
-        open={showDiscardDialog}
-        onOpenChange={(open) => !open && handleCancelDiscard()}
-        srTitle='Unsaved changes'
-        title='Unsaved changes'
-        text='You have unsaved changes. Are you sure you want to discard them?'
-        dismissLabel='Keep editing'
-        confirm={{
-          label: 'Discard changes',
-          onClick: handleConfirmDiscard,
-        }}
-      />
     </>
   )
 }

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { cpSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { type BuildOptions, build } from 'esbuild'
 import postcss from 'postcss'
@@ -39,52 +39,6 @@ rmSync(generatedWindowsIcon, { force: true })
 cpSync(join(appIcon, 'Assets', 'logo.png'), generatedWindowsIcon)
 console.log(`• Selecting desktop icon: ${appIcon}`)
 
-function compileNativeHelpSearch(): void {
-  const outputDirectory = 'dist/native'
-  rmSync(outputDirectory, { force: true, recursive: true })
-  if (process.platform !== 'darwin') return
-
-  const nodeExecutable = execFileSync('node', ['-p', 'process.execPath'], {
-    encoding: 'utf8',
-  }).trim()
-  const nodeIncludeDirectory = join(dirname(nodeExecutable), '..', 'include', 'node')
-  const nodeApiHeader = join(nodeIncludeDirectory, 'node_api.h')
-  if (!existsSync(nodeApiHeader)) {
-    throw new Error(`Could not find Node-API headers at ${nodeApiHeader}`)
-  }
-
-  mkdirSync(outputDirectory, { recursive: true })
-  execFileSync(
-    'xcrun',
-    [
-      'clang++',
-      '-std=c++17',
-      '-DNAPI_VERSION=8',
-      '-fobjc-arc',
-      '-fblocks',
-      '-bundle',
-      '-undefined',
-      'dynamic_lookup',
-      '-mmacosx-version-min=12.0',
-      '-arch',
-      'arm64',
-      '-arch',
-      'x86_64',
-      '-I',
-      nodeIncludeDirectory,
-      '-framework',
-      'AppKit',
-      '-framework',
-      'Foundation',
-      '-o',
-      join(outputDirectory, 'help-search.node'),
-      'native/help-search.mm',
-    ],
-    { stdio: 'inherit' }
-  )
-  console.log('• Compiled native macOS documentation Help search')
-}
-
 const common = {
   bundle: true,
   platform: 'node' as const,
@@ -123,14 +77,17 @@ const renderer: BuildOptions = {
     {
       name: 'desktop-tailwind',
       setup(builder) {
-        builder.onLoad({ filter: /shell\.css$/ }, async ({ path }) => {
+        builder.onLoad({ filter: /(?:shell|utilities|styles\.module)\.css$/ }, async ({ path }) => {
           const config = await loadPostcssConfig({}, resolve('../sim'))
           const result = await postcss(config.plugins).process(readFileSync(path, 'utf8'), {
             from: path,
           })
           return {
-            contents: result.css,
-            loader: 'css',
+            contents: result.css.replace(
+              /url\(["']?\.\/assets\/(geist[^)"']+)["']?\)/g,
+              'url(./$1)'
+            ),
+            loader: path.endsWith('.module.css') ? 'local-css' : 'css',
             resolveDir: dirname(path),
             watchFiles: result.messages.flatMap((message) =>
               message.type === 'dependency' ? [message.file as string] : []
@@ -143,7 +100,13 @@ const renderer: BuildOptions = {
 }
 
 async function run(): Promise<void> {
-  compileNativeHelpSearch()
+  execFileSync(process.execPath, ['run', 'scripts/build-native.ts', '--computer-use'], {
+    stdio: 'inherit',
+  })
+  mkdirSync('dist/renderer', { recursive: true })
+  for (const font of ['geist-variable.woff2', 'geist-mono-variable.woff2']) {
+    cpSync(resolve('../../packages/auth-ui/src/assets', font), join('dist/renderer', font))
+  }
   if (watch) {
     const { context } = await import('esbuild')
     const rendererCtx = await context(renderer)

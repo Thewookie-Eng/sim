@@ -74,6 +74,20 @@ async function runAdmissionTransaction(
   providerId: string
 ): Promise<SuccessfulAdmission> {
   return db.transaction(async (tx) => {
+    const [scope] = await tx
+      .select({ id: ssoProvider.id, organizationId: ssoProvider.organizationId })
+      .from(ssoProvider)
+      .where(eq(ssoProvider.providerId, providerId))
+      .limit(1)
+    if (!scope) {
+      return { providerId, result: { kind: 'denied', reason: 'provider-not-found' } }
+    }
+    if (scope.organizationId) {
+      await acquireOrganizationUserMutationLocks(tx, {
+        userId,
+        organizationIds: [scope.organizationId],
+      })
+    }
     const [provider] = await tx
       .select({
         id: ssoProvider.id,
@@ -83,11 +97,11 @@ async function runAdmissionTransaction(
         organizationId: ssoProvider.organizationId,
       })
       .from(ssoProvider)
-      .where(eq(ssoProvider.providerId, providerId))
+      .where(and(eq(ssoProvider.id, scope.id), eq(ssoProvider.providerId, providerId)))
       .limit(1)
       .for('share')
 
-    if (!provider) {
+    if (!provider || provider.organizationId !== scope.organizationId) {
       return { providerId, result: { kind: 'denied', reason: 'provider-not-found' } }
     }
     if (!provider.domainVerified) {
@@ -96,7 +110,12 @@ async function runAdmissionTransaction(
 
     const [[userRow], [linkedAccount]] = await Promise.all([
       tx
-        .select({ id: user.id, email: user.email, name: user.name })
+        .select({
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          emailVerified: user.emailVerified,
+        })
         .from(user)
         .where(eq(user.id, userId))
         .limit(1),
@@ -119,6 +138,19 @@ async function runAdmissionTransaction(
       return { providerId, result: { kind: 'denied', reason: 'domain-mismatch' } }
     }
 
+    /**
+     * `trustEmailVerified` stays off, so Better Auth always stores an SSO user as
+     * unverified. Signing in through a linked provider on a DNS-verified domain
+     * that matches the address is the ownership proof, and without it SSO- and
+     * SCIM-created users can never connect accounts.
+     */
+    if (!userRow.emailVerified) {
+      await tx
+        .update(user)
+        .set({ emailVerified: true, updatedAt: new Date() })
+        .where(and(eq(user.id, userId), eq(user.email, userRow.email)))
+    }
+
     const attribution = { providerId, userName: userRow.name, userEmail: userRow.email }
     if (!provider.organizationId) {
       return {
@@ -126,11 +158,6 @@ async function runAdmissionTransaction(
         result: { kind: 'organization-not-bound', organizationId: null },
       }
     }
-
-    await acquireOrganizationUserMutationLocks(tx, {
-      userId,
-      organizationIds: [provider.organizationId],
-    })
 
     /**
      * An organization whose directory is the only way in has said so on its

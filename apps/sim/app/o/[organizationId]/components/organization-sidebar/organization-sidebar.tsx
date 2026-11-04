@@ -22,7 +22,7 @@ import { useOrganizationContext } from '@/app/o/[organizationId]/providers/organ
 import { OrganizationSettingsSidebar } from '@/app/o/[organizationId]/settings/organization-settings-sidebar'
 import { useSidebarChrome } from '@/app/workspace/[workspaceId]/components/workspace-chrome'
 import { useRegisterGlobalCommands } from '@/app/workspace/[workspaceId]/providers/global-commands-provider'
-import { createCommands } from '@/app/workspace/[workspaceId]/utils/commands-utils'
+import { createCommands } from '@/app/workspace/[workspaceId]/utils/commands'
 import {
   HelpModal,
   isNavItemActive,
@@ -40,7 +40,6 @@ import { useSidebarResize } from '@/app/workspace/[workspaceId]/w/components/sid
 import { isSidebarBackgroundClick } from '@/app/workspace/[workspaceId]/w/components/sidebar/utils'
 import { useContextMenu } from '@/hooks/use-context-menu'
 import { useFolderStore } from '@/stores/folders/store'
-import { useSidebarStore } from '@/stores/sidebar/store'
 
 const logger = createLogger('OrganizationSidebar')
 
@@ -54,6 +53,12 @@ const DRAG_EXEMPT_CLASS = '[-webkit-app-region:no-drag]'
 interface OrganizationChatsProps
   extends Omit<ComponentProps<typeof ChatsSection>, 'chats' | 'isLoading'> {
   organizationId: string
+}
+
+interface OrganizationSidebarProps {
+  benchmarkEnabled?: boolean
+  simLinksEnabled?: boolean
+  peopleEnabled?: boolean
 }
 
 function OrganizationChats({ organizationId, ...props }: OrganizationChatsProps) {
@@ -70,8 +75,12 @@ function OrganizationChats({ organizationId, ...props }: OrganizationChatsProps)
  * the desktop hover-peek all behave identically. Collapse and peek state come from
  * the chrome through {@link useSidebarChrome}.
  */
-export const OrganizationSidebar = memo(function OrganizationSidebar() {
-  const { isCollapsed: railCollapsed, isPeeking } = useSidebarChrome()
+export const OrganizationSidebar = memo(function OrganizationSidebar({
+  benchmarkEnabled = false,
+  simLinksEnabled = false,
+  peopleEnabled = false,
+}: OrganizationSidebarProps) {
+  const { isCollapsed: railCollapsed, isPeeking, onToggle: toggleCollapsed } = useSidebarChrome()
   /** The peek card always renders the expanded layout, whatever the rail's state. */
   const isCollapsed = railCollapsed && !isPeeking
 
@@ -82,7 +91,6 @@ export const OrganizationSidebar = memo(function OrganizationSidebar() {
   const posthog = usePostHog()
   const { organization, viewer, searchAccess, mothershipAvailable, canBuild } =
     useOrganizationContext()
-  const toggleCollapsed = useSidebarStore((state) => state.toggleCollapsed)
   const { handlePointerDown } = useSidebarResize()
   const showCollapsedTooltips = isCollapsed
   const scrollEdges = useScrollEdges(scrollContainerRef, {
@@ -91,8 +99,14 @@ export const OrganizationSidebar = memo(function OrganizationSidebar() {
   })
 
   const isMac = isMacPlatform()
-  const canUseHome = mothershipAvailable && (canBuild || searchAccess.memberScoped)
-  const navItems = buildOrganizationNavItems(organization.id, searchAccess.memberScoped, canUseHome)
+  const canUseHome = mothershipAvailable && canBuild
+  const navItems = buildOrganizationNavItems(organization.id, {
+    searchAvailable: searchAccess.memberScoped,
+    mothershipAvailable: canUseHome,
+    benchmarkEnabled,
+    simLinksEnabled,
+    peopleEnabled,
+  })
   const settingsPath = organizationRoutes(organization.id).settings
   const isSettings = pathname === settingsPath || pathname?.startsWith(`${settingsPath}/`)
 
@@ -187,7 +201,7 @@ export const OrganizationSidebar = memo(function OrganizationSidebar() {
           >
             <OrganizationHeader
               organization={organization}
-              canEditLogo={viewer.isAdmin}
+              canEditIdentity={viewer.isAdmin}
               canInviteMembers={viewer.canInviteMembers}
               isCollapsed={isCollapsed}
               onExpandSidebar={toggleCollapsed}
@@ -195,7 +209,7 @@ export const OrganizationSidebar = memo(function OrganizationSidebar() {
             <div
               inert={isCollapsed}
               className={cn(
-                'flex h-[30px] items-center gap-[1px] overflow-hidden',
+                'flex h-[30px] items-center gap-[1px] overflow-hidden max-md:hidden',
                 isCollapsed
                   ? 'w-0 opacity-0'
                   : 'w-[32px] [[data-sim-desktop-title-bar=inset]_&]:w-0'
@@ -212,7 +226,10 @@ export const OrganizationSidebar = memo(function OrganizationSidebar() {
                   aria-label='Collapse sidebar'
                   onClick={toggleCollapsed}
                   tabIndex={isCollapsed ? -1 : undefined}
-                  className={cn(DRAG_EXEMPT_CLASS, '[[data-sim-desktop-title-bar=inset]_&]:hidden')}
+                  className={cn(
+                    DRAG_EXEMPT_CLASS,
+                    'max-md:hidden [[data-sim-desktop-title-bar=inset]_&]:hidden'
+                  )}
                 />
               </SidebarTooltip>
             </div>
@@ -271,7 +288,7 @@ export const OrganizationSidebar = memo(function OrganizationSidebar() {
                     isCollapsed={isCollapsed}
                     pathname={pathname}
                   />
-                  {canUseHome && (
+                  {mothershipAvailable && (canBuild || searchAccess.memberScoped) && (
                     <OrganizationChats
                       key={organization.id}
                       organizationId={organization.id}
@@ -310,7 +327,7 @@ export const OrganizationSidebar = memo(function OrganizationSidebar() {
       {!isPeeking && (
         <div
           className={cn(
-            'absolute top-0 right-0 bottom-0 z-20 w-[8px] translate-x-1/2',
+            'absolute top-0 right-0 bottom-0 z-20 hidden w-[8px] translate-x-1/2 md:block',
             isCollapsed ? 'cursor-e-resize' : 'cursor-ew-resize'
           )}
           onPointerDown={isCollapsed ? undefined : handlePointerDown}

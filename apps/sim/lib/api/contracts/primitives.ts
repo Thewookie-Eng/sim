@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { setRecordValue } from '@/lib/core/utils/records'
 import { EXACT_ENVIRONMENT_REFERENCE } from '@/lib/environment/reference'
 import { PII_LANGUAGE_CODES, stripNerEntities } from '@/lib/guardrails/pii-entities'
-import { validateRegexPattern } from '@/lib/guardrails/validate_regex'
+import { validateRegexPattern } from '@/lib/guardrails/validate-regex'
 
 export const unknownRecordSchema = z.record(z.string(), z.unknown())
 
@@ -604,6 +604,35 @@ export const retentionOverridesSchema = z
   )
 
 export type RetentionOverrides = z.output<typeof retentionOverridesSchema>
+
+/**
+ * A list-valued query param, sent repeated (`a=x&a=y`, how `requestJson` serializes an array) or
+ * comma-separated (`a=x,y`): entries trimmed, empty ones dropped. `canonical` also de-duplicates
+ * and sorts them, for a filter the query treats as a set — so `x,y` and `y,x` are one filter, for
+ * the query and for a cursor bound to it — and reads an empty set (`a=`) as no filter at all.
+ */
+export function queryListSchema<T extends z.ZodType<string>>(
+  member: T,
+  options: { max?: number; canonical?: boolean } = {}
+) {
+  const entries =
+    options.max === undefined
+      ? z.array(member)
+      : z.array(member).max(options.max, `Cannot list more than ${options.max} values`)
+  const split = (raw: unknown) => {
+    if (typeof raw !== 'string' && !Array.isArray(raw)) return raw
+    return (Array.isArray(raw) ? raw : [raw])
+      .flatMap((entry) => (typeof entry === 'string' ? entry.split(',') : [entry]))
+      .map((entry) => (typeof entry === 'string' ? entry.trim() : entry))
+      .filter((entry) => entry !== '')
+  }
+  if (!options.canonical) return z.preprocess(split, entries)
+  return z.preprocess((raw) => {
+    const values = split(raw)
+    if (!Array.isArray(values)) return values
+    return values.length === 0 ? undefined : [...new Set(values)].sort()
+  }, entries.optional())
+}
 
 export const booleanQueryFlagSchema = z.preprocess(
   (value) => {

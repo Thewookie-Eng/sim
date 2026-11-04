@@ -9,7 +9,9 @@ import { LIBRARY_SECTION } from '@/lib/library/seo'
 import { COMPARISON_SECTIONS, getFactGroup } from '@/app/(landing)/comparisons/comparison-sections'
 import { BrandIconTile, SimIconTile } from '@/app/(landing)/comparisons/components/brand-icon-tile'
 import { ComparisonCards } from '@/app/(landing)/comparisons/components/comparison-cards'
+import { ComparisonLinkRow } from '@/app/(landing)/comparisons/components/comparison-link-row'
 import { ComparisonTable } from '@/app/(landing)/comparisons/components/comparison-table'
+import { MigrationSection } from '@/app/(landing)/comparisons/components/migration-section'
 import { ProseText } from '@/app/(landing)/comparisons/components/prose-text'
 import { getLibraryPostsForCompetitor } from '@/app/(landing)/comparisons/library-links'
 import {
@@ -60,8 +62,10 @@ export async function generateMetadata({
   }
 
   return buildLandingMetadata({
-    title: `Sim vs ${competitor.name} | Sim, the AI Workspace`,
-    description: `Compare Sim, the open-source AI workspace, to ${competitor.name} on platform, AI, integrations, pricing, security, and support. Sourced and dated facts.`,
+    title: competitor.seoTitle ?? `Sim vs ${competitor.name} | Sim, the AI Workspace`,
+    description:
+      competitor.seoDescription ??
+      `Compare Sim, the open-source AI workspace, to ${competitor.name} on platform, AI, integrations, pricing, security, and support. Sourced and dated facts.`,
     path: `/comparisons/${competitor.id}`,
     keywords: [
       `Sim vs ${competitor.name}`,
@@ -72,6 +76,7 @@ export async function generateMetadata({
       'AI agent workspace',
       'AI workflow automation comparison',
     ].join(', '),
+    routeImage: true,
   })
 }
 
@@ -91,6 +96,7 @@ export default async function ComparisonProviderPage({
   const relatedPosts = await getLibraryPostsForCompetitor(competitor)
   const verdict = buildBottomLine(competitor)
   const CompetitorIcon = competitor.brand?.icon
+  const otherCompetitors = ALL_COMPETITORS.filter((other) => other.id !== competitor.id)
 
   const breadcrumbJsonLd = {
     '@context': 'https://schema.org',
@@ -125,6 +131,7 @@ export default async function ComparisonProviderPage({
         position: 1,
         item: {
           '@type': 'SoftwareApplication',
+          '@id': `${SITE_URL}#software`,
           name: 'Sim',
           applicationCategory: 'BusinessApplication',
           url: SITE_URL,
@@ -212,6 +219,12 @@ export default async function ComparisonProviderPage({
 
         <div className={cn(LANDING_CONTENT_WIDTH, LANDING_GUTTER)}>
           <div className='border-[var(--border)] border-x'>
+            {competitor.migration ? (
+              <>
+                <MigrationSection migration={competitor.migration} />
+                <div className='h-px w-full bg-[var(--border)]' />
+              </>
+            ) : null}
             {competitor.betterThanAnswer ? (
               <>
                 <section aria-labelledby='better-than-heading' className='px-6 py-10'>
@@ -376,6 +389,22 @@ export default async function ComparisonProviderPage({
                 <div className='h-px w-full bg-[var(--border)]' />
               </>
             ) : null}
+
+            <section aria-labelledby='more-comparisons-heading'>
+              <h2
+                id='more-comparisons-heading'
+                className='px-6 pt-10 pb-6 text-[var(--text-primary)] text-xl leading-[100%] tracking-[-0.02em] lg:text-2xl'
+              >
+                More comparisons
+              </h2>
+              <ul className='grid grid-cols-1 gap-px border-[var(--border)] border-y bg-[var(--border)] lg:grid-cols-2'>
+                {otherCompetitors.map((other) => (
+                  <li key={other.id} className='bg-[var(--bg)] lg:odd:last:col-span-2'>
+                    <ComparisonLinkRow competitor={other} />
+                  </li>
+                ))}
+              </ul>
+            </section>
 
             <section aria-labelledby='faq-heading' className='px-6 py-10'>
               <h2

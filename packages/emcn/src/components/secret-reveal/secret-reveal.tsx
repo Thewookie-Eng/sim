@@ -21,7 +21,7 @@
 import { useCopyToClipboard } from '../../hooks/use-copy-to-clipboard'
 import { Button, Check, Duplicate } from '../../index'
 import { cn } from '../../lib/cn'
-import { chipFieldSurfaceClass, chipFieldTextClass } from '../chip/chip-chrome'
+import { chipFieldSurfaceClass, chipFieldTextClass } from '../chip/chrome'
 
 const REDACTED_DOTS = '••••••••••••••••••••••••••••••••'
 
@@ -44,6 +44,7 @@ export function SecretReveal({ value, className, redacted = false }: SecretRevea
 
   return (
     <div
+      data-sim-extension-ignore
       className={cn(
         'flex h-[30px] w-full items-center gap-1.5 px-2',
         chipFieldSurfaceClass,

@@ -502,6 +502,16 @@ export const getOrganizationResponseSchema = z.object({
   }),
   userRole: organizationRoleSchema,
   hasAdminAccess: z.boolean(),
+  chatAccess: z
+    .object({
+      mothershipAvailable: z.boolean(),
+      canBuild: z.boolean(),
+      searchAccess: z.object({
+        sourceMirrored: z.boolean(),
+        memberScoped: z.boolean(),
+      }),
+    })
+    .optional(),
 })
 export type GetOrganizationResponse = z.output<typeof getOrganizationResponseSchema>
 export const getOrganizationContract = defineRouteContract({
@@ -715,6 +725,33 @@ export const createOrganizationContract = defineRouteContract({
       organizationId: z.string(),
       created: z.boolean(),
     }),
+  },
+})
+
+const organizationPlanSeatsResponseSchema = z.object({
+  success: z.literal(true),
+  data: z.object({
+    organizationId: z.string().min(1),
+    subscriptionPlan: z.string().min(1).nullable(),
+    subscriptionStatus: z.string().nullable(),
+    totalSeats: z.number().int().nonnegative(),
+    usedSeats: z.number().int().nonnegative(),
+    membersTotal: z.number().int().nonnegative(),
+    hasEnterprisePlan: z.boolean(),
+  }),
+})
+
+/** Primary-backed plan access and canonical member/invitation seat reservations. */
+export type OrganizationPlanSeatsResponse = z.output<typeof organizationPlanSeatsResponseSchema>
+
+/** Lightweight settings read that excludes usage-ledger aggregates. */
+export const getOrganizationPlanSeatsContract = defineRouteContract({
+  method: 'GET',
+  path: '/api/organizations/[id]/billing-plan',
+  params: organizationParamsSchema,
+  response: {
+    mode: 'json',
+    schema: organizationPlanSeatsResponseSchema,
   },
 })
 

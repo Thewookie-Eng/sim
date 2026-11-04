@@ -21,7 +21,7 @@ import { computeWeeklyRefreshConsumed } from '@/lib/billing/credits/weekly-refre
 import { getPlanWeeklyRefreshDollars, isEnterprise, isFree } from '@/lib/billing/plan-helpers'
 import { ENTITLED_SUBSCRIPTION_STATUSES, getPlanPricing } from '@/lib/billing/subscriptions/utils'
 import { toDecimal, toNumber } from '@/lib/billing/utils/decimal'
-import { OUTBOX_EVENT_TYPES } from '@/lib/billing/webhooks/outbox-handlers'
+import { OUTBOX_EVENT_TYPES } from '@/lib/billing/webhooks/outbox-events'
 import { enqueueOutboxEvent } from '@/lib/core/outbox/service'
 import { mapWithConcurrency } from '@/lib/core/utils/concurrency'
 import type { DbOrTx } from '@/lib/db/types'
@@ -373,7 +373,11 @@ export async function closeElapsedBillingPeriod(
       and(
         eq(usageLog.billingEntityType, billingEntity.type),
         eq(usageLog.billingEntityId, billingEntity.id),
-        eq(usageLog.billingPeriodEnd, periodStart)
+        eq(usageLog.billingPeriodEnd, periodStart),
+        // The elapsed period starts before it ends; stating it lets the backward scan of the
+        // covering period index skip the current period's entries, which its unique keys can't
+        // deduplicate, instead of walking all of them to reach the previous period.
+        lt(usageLog.billingPeriodStart, periodStart)
       )
     )
   const expectedPrevStart = prevStamp?.start ?? minusOneInterval(periodStart, sub.billingInterval)

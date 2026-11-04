@@ -1,21 +1,21 @@
 'use client'
 
-import { Suspense, useEffect, useRef, useState } from 'react'
+import { Suspense, useRef, useState } from 'react'
 import { Turnstile, type TurnstileInstance } from '@marsidev/react-turnstile'
 import { createLogger } from '@sim/logger'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { usePostHog } from 'posthog-js/react'
 import { trackFreebuffConversion } from '@/lib/analytics/freebuff'
 import { trackGoogleEvent } from '@/lib/analytics/google'
-import { client, useSession } from '@/lib/auth/auth-client'
+import { client, useSession } from '@/lib/auth/client'
+import { DISPOSABLE_EMAIL_ERROR_CODE, DISPOSABLE_EMAIL_MESSAGE } from '@/lib/auth/constants'
 import { useTrackingConsent } from '@/lib/consent/tracking-consent'
 import { getEnv, isFalsy } from '@/lib/core/config/env'
 import { isSsoEnabled } from '@/lib/core/config/env-flags'
 import { validateCallbackUrl } from '@/lib/core/security/input-validation'
 import { quickValidateEmail } from '@/lib/messaging/email/validation'
-import { captureClientEvent, captureEvent } from '@/lib/posthog/client'
+import { captureEvent } from '@/lib/posthog/client'
 import {
-  buildAuthCrossLink,
   DEFAULT_POST_AUTH_ROUTE,
   POST_AUTH_REDIRECT_STORAGE_KEY,
   resolveAuthRedirect,
@@ -24,17 +24,19 @@ import {
 } from '@/app/(auth)/auth-redirect'
 import {
   AuthDivider,
+  AuthEmailInput,
   AuthField,
   AuthFormMessage,
   AuthHeader,
   AuthInput,
   AuthLegalFooter,
-  AuthNavPrompt,
   AuthSubmitButton,
   PasswordInput,
   SocialLoginButtons,
   SSOLoginButton,
 } from '@/app/(auth)/components'
+import SignupLoading from '@/app/(auth)/signup/loading'
+import { useCaptureWhenReady } from '@/hooks/use-capture-when-ready'
 
 const logger = createLogger('SignupForm')
 
@@ -111,11 +113,9 @@ function SignupFormContent({
   const { refetch: refetchSession } = useSession()
   const posthog = usePostHog()
   const { measurement, marketing } = useTrackingConsent()
+  useCaptureWhenReady('signup_page_viewed', {})
   const [isLoading, setIsLoading] = useState(false)
 
-  useEffect(() => {
-    captureClientEvent('signup_page_viewed', {})
-  }, [])
   const [password, setPassword] = useState('')
   const [passwordErrors, setPasswordErrors] = useState<string[]>([])
   const [showValidationError, setShowValidationError] = useState(false)
@@ -126,7 +126,7 @@ function SignupFormContent({
   const [formError, setFormError] = useState<string | null>(null)
   const turnstileRef = useRef<TurnstileInstance>(null)
   const [turnstileSiteKey] = useState(() => getEnv('NEXT_PUBLIC_TURNSTILE_SITE_KEY'))
-  const { rawCallbackUrl: rawRedirectUrl, isInviteFlow } = resolveAuthRedirect({
+  const { rawCallbackUrl: rawRedirectUrl } = resolveAuthRedirect({
     redirect: searchParams.get('redirect'),
     callbackUrl: searchParams.get('callbackUrl'),
     inviteFlow: searchParams.get('invite_flow'),
@@ -302,6 +302,9 @@ function SignupFormContent({
             if (ctx.error.code?.includes('USER_ALREADY_EXISTS')) {
               errorCode = 'user_already_exists'
               setEmailError('An account with this email already exists. Please sign in instead.')
+            } else if (ctx.error.code === DISPOSABLE_EMAIL_ERROR_CODE) {
+              errorCode = 'disposable_email'
+              setEmailError(DISPOSABLE_EMAIL_MESSAGE)
             } else if (
               ctx.error.code?.includes('BAD_REQUEST') ||
               ctx.error.message?.includes('Email and password sign up is not enabled')
@@ -405,16 +408,22 @@ function SignupFormContent({
   const canSubmit = name.trim().length > 0 && email.trim().length > 0 && password.length > 0
 
   return (
-    <div className='space-y-6'>
-      <AuthHeader title='Create an account' description='Create an account or log in' />
+    <div className='au:space-y-[var(--auth-group-gap)]'>
+      <AuthHeader title='Create an account' description='Get started with Sim.' />
+
+      {!emailEnabled && !hasSocial && !ssoEnabled && (
+        <AuthFormMessage type='error'>
+          No sign-in methods are enabled. Contact your administrator for access.
+        </AuthFormMessage>
+      )}
 
       {hasOnlySSO && (
         <SSOLoginButton callbackURL={redirectUrl || DEFAULT_POST_AUTH_ROUTE} variant='primary' />
       )}
 
       {emailEnabled && (
-        <form onSubmit={onSubmit} className='space-y-6'>
-          <div className='space-y-5'>
+        <form onSubmit={onSubmit} className='au:space-y-[var(--auth-group-gap)]'>
+          <div className='au:space-y-5'>
             <AuthField htmlFor='name' label='Full name' errors={nameFieldErrors}>
               <AuthInput
                 id='name'
@@ -424,32 +433,36 @@ function SignupFormContent({
                 autoCapitalize='words'
                 autoComplete='name'
                 title='Name can only contain letters, spaces, hyphens, and apostrophes'
+                disabled={isLoading}
                 value={name}
                 onChange={handleNameChange}
                 error={nameFieldErrors.length > 0}
               />
             </AuthField>
             <AuthField htmlFor='email' label='Email' errors={emailFieldErrors}>
-              <AuthInput
+              <AuthEmailInput
                 id='email'
                 name='email'
-                placeholder='Enter your email'
-                autoCapitalize='none'
-                autoComplete='email'
-                autoCorrect='off'
+                disabled={isLoading}
                 value={email}
                 onChange={handleEmailChange}
                 error={emailHasError}
               />
             </AuthField>
-            <AuthField htmlFor='password' label='Password' errors={passwordFieldErrors}>
+            <AuthField
+              htmlFor='password'
+              label='Password'
+              errors={passwordFieldErrors}
+              hint='8+ characters, upper/lowercase, number and symbol.'
+            >
               <PasswordInput
                 id='password'
                 name='password'
                 autoCapitalize='none'
                 autoComplete='new-password'
-                placeholder='Enter your password'
+                aria-describedby='password-hint'
                 autoCorrect='off'
+                disabled={isLoading}
                 value={password}
                 onChange={handlePasswordChange}
                 error={passwordFieldErrors.length > 0}
@@ -485,25 +498,15 @@ function SignupFormContent({
 
       {showBottomSection && (
         <SocialLoginButtons
+          view='signup'
           githubAvailable={githubAvailable}
           googleAvailable={googleAvailable}
           microsoftAvailable={microsoftAvailable}
           callbackURL={redirectUrl || DEFAULT_POST_AUTH_ROUTE}
-        >
-          {ssoEnabled && !hasOnlySSO && (
-            <SSOLoginButton
-              callbackURL={redirectUrl || DEFAULT_POST_AUTH_ROUTE}
-              variant='outline'
-            />
-          )}
-        </SocialLoginButtons>
+          ssoEnabled={ssoEnabled && !hasOnlySSO}
+          disabled={isLoading}
+        />
       )}
-
-      <AuthNavPrompt
-        prompt='Already have an account?'
-        href={buildAuthCrossLink('/login', { callbackUrl: redirectUrl || null, isInviteFlow })}
-        linkLabel='Sign in'
-      />
 
       <AuthLegalFooter action='creating an account' />
     </div>
@@ -518,9 +521,7 @@ export default function SignupPage({
   emailVerificationEnabled,
 }: SignupFormProps) {
   return (
-    <Suspense
-      fallback={<div className='flex min-h-[320px] items-center justify-center'>Loading…</div>}
-    >
+    <Suspense fallback={<SignupLoading />}>
       <SignupFormContent
         githubAvailable={githubAvailable}
         googleAvailable={googleAvailable}

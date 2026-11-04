@@ -2,6 +2,15 @@ import { OTLPLogExporter } from '@opentelemetry/exporter-logs-otlp-http'
 import { OTLPMetricExporter } from '@opentelemetry/exporter-metrics-otlp-http'
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http'
 import { resourceFromAttributes } from '@opentelemetry/resources'
+import { createLogger } from '@sim/logger'
+import {
+  diffTriggerEnv,
+  resolveTriggerEnvFromAppSecret,
+  TRIGGER_CONSTANT_VARS,
+} from '@sim/runtime-secrets/trigger-env'
+import { distrustCompromisedRoots } from '@sim/security/tls-trust'
+import { getErrorMessage } from '@sim/utils/errors'
+import type { BuildExtension } from '@trigger.dev/build'
 import {
   additionalFiles,
   additionalPackages,
@@ -63,6 +72,71 @@ function getFunctionExecutionEnvVars() {
   })
 }
 
+/**
+ * Mirrors the app's env-vars secret into an environment listed in
+ * `TRIGGER_ENV_SYNC_TARGETS`, logging only counts, never names or values (CI
+ * logs are public). Exits on failure: `syncEnvVars` catches a thrown error and
+ * deploys without syncing, and a failed deploy leaves the running version and
+ * its environment untouched where a silent skip would keep stale configuration.
+ */
+async function syncFromAppSecret(environment: string, deployedEnv: Record<string, string>) {
+  const logger = createLogger('TriggerEnvSync')
+  try {
+    const { secretId, vars } = await resolveTriggerEnvFromAppSecret(environment)
+    const { added, changed } = diffTriggerEnv(vars, deployedEnv)
+    logger.info('Syncing the Trigger.dev environment from the app env-vars secret', {
+      environment,
+      secretId,
+      total: vars.length,
+      added: added.length,
+      changed: changed.length,
+    })
+    return vars
+  } catch (error) {
+    logger.error('Trigger.dev env sync failed; aborting the deploy', {
+      environment,
+      error: getErrorMessage(error),
+    })
+    process.exit(1)
+  }
+}
+
+/**
+ * Node.js version copied into the task image, in lockstep with `NODE_VERSION`
+ * in `docker/app.Dockerfile`: `isolated-vm` 6.x loads its Node 24 (ABI 137)
+ * prebuild. The image is pinned by its multi-arch index digest.
+ */
+const NODE_VERSION = '24.22.1'
+const NODE_IMAGE = `node:${NODE_VERSION}-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c`
+
+/**
+ * Tasks run on Bun, but the `bun-1.4` image ships no `node`, and the
+ * isolated-vm sandbox worker and the Oracle Database worker are spawned as
+ * `node` child processes, the same split as the app image. Adding image
+ * instructions also builds the install stage from this base, so `bun install`
+ * runs `isolated-vm`'s install script against the same Node. Deploy only:
+ * `trigger dev` spawns the developer's own `node`.
+ *
+ * @see https://trigger.dev/docs/guides/frameworks/bun#choosing-a-bun-runtime
+ */
+function nodeBinary(): BuildExtension {
+  return {
+    name: 'node-binary',
+    onBuildComplete(context) {
+      if (context.target === 'dev') return
+      context.addLayer({
+        id: 'node-binary',
+        image: {
+          instructions: [
+            `COPY --from=${NODE_IMAGE} /usr/local/bin/node /usr/local/bin/node`,
+            `RUN [ "$(node --version)" = "v${NODE_VERSION}" ]`,
+          ],
+        },
+      })
+    },
+  }
+}
+
 const grafanaTelemetry = grafanaFullyConfigured
   ? (() => {
       const baseUrl = grafanaEndpoint!.replace(/\/+$/, '')
@@ -86,8 +160,8 @@ const grafanaTelemetry = grafanaFullyConfigured
 
 export default defineConfig({
   project: env.TRIGGER_PROJECT_ID!,
-  runtime: 'node-24',
-  logLevel: 'log',
+  runtime: 'bun-1.4',
+  logLevel: 'info',
   maxDuration: 5400,
   retries: {
     enabledInDev: false,
@@ -106,7 +180,9 @@ export default defineConfig({
    */
   ignorePatterns: ['**/*.{test,spec,integration}.{ts,tsx,mts,cts,js,jsx,mjs,cjs}'],
   /**
-   * Runs before any task run, in the run process. Marks the process so that
+   * Runs before any task run, in the run process. First drops the compromised
+   * eMudhra roots from the default CA set, before the run opens any TLS
+   * connection (see `@sim/security/tls-trust`). Then marks the process so that
    * dispatch decisions further down the call graph stop inferring from
    * environment variables whether Trigger.dev is available: a process that
    * Trigger.dev is executing has Trigger.dev available by definition.
@@ -119,14 +195,21 @@ export default defineConfig({
    * because a throw here fails the run. The execution-signal subscriber is
    * deliberately not warmed here: only the tasks that execute a workflow ever
    * subscribe, and they are a minority of runs, so that connection is warmed
-   * on intent at the execution entry point instead.
+   * on intent at the execution entry point instead. The same step refreshes
+   * workload-identity AWS credentials (`prepareTriggerAttempt`).
    *
    * @see https://trigger.dev/docs/config/config-file#lifecycle-functions
    */
   init: async () => {
+    const tlsTrust = distrustCompromisedRoots()
+    if (tlsTrust.unsupported || tlsTrust.error) {
+      createLogger('TriggerInit').error('Could not distrust compromised CA roots', tlsTrust)
+    }
     markInsideTriggerRun()
-    const { warmRedisConnection } = await import('./lib/core/config/redis')
-    await warmRedisConnection()
+    const { reportAccountTokenSealing } = await import('@sim/db/sealed-text')
+    reportAccountTokenSealing()
+    const { prepareTriggerAttempt } = await import('./lib/core/config/trigger-attempt')
+    await prepareTriggerAttempt()
   },
   ...(grafanaTelemetry ? { telemetry: grafanaTelemetry } : {}),
   build: {
@@ -145,25 +228,26 @@ export default defineConfig({
       // breaks inside the worker bundle; it must load from node_modules.
       'pdfjs-dist',
       '@napi-rs/canvas',
+      // Native libvips binding; knowledge processing reads and downscales images with it.
+      'sharp',
     ],
     extensions: [
-      syncEnvVars(() => [
-        { name: 'DB_APP_NAME', value: 'sim-trigger' },
-        /**
-         * Workers run Trigger.dev by definition, but the flag saying so was only
-         * set on the app container. Syncing it keeps the deployment flag honest
-         * inside runs; the dispatch decision itself no longer depends on it,
-         * because the `init` hook above marks the run process directly.
-         */
-        { name: 'TRIGGER_DEV_ENABLED', value: 'TRUE' },
-        ...getFunctionExecutionEnvVars(),
-      ]),
+      nodeBinary(),
+      syncEnvVars(({ environment, env: deployedEnv }) =>
+        env.TRIGGER_ENV_SYNC_TARGETS?.split(',').includes(environment)
+          ? syncFromAppSecret(environment, deployedEnv)
+          : [...TRIGGER_CONSTANT_VARS, ...getFunctionExecutionEnvVars()]
+      ),
       additionalFiles({
         files: [
           './lib/execution/isolated-vm-worker.cjs',
           './lib/execution/sandbox/bundles/pptxgenjs.cjs',
           './lib/execution/sandbox/bundles/docx.cjs',
           './lib/execution/sandbox/bundles/pdf-lib.cjs',
+          './lib/internal/oracledb/oracle-worker.cjs',
+          './scripts/oracledb-patch-self-test.cjs',
+          './scripts/verify-oracledb-patch.cjs',
+          '../../node_modules/oracledb/**/*',
         ],
       }),
       additionalPackages({
@@ -177,6 +261,7 @@ export default defineConfig({
           '@daytona/sdk',
           'pdfjs-dist',
           '@napi-rs/canvas',
+          'sharp',
         ],
       }),
     ],

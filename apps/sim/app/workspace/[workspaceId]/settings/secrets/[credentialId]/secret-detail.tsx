@@ -21,7 +21,6 @@ import {
   CredentialDetailLayout,
   CredentialMembersSection,
   DetailSection,
-  UnsavedChangesModal,
   useCredentialDetailForm,
 } from '@/app/workspace/[workspaceId]/components/credential-detail'
 import { ResourceTile } from '@/app/workspace/[workspaceId]/components/resource-tile'
@@ -162,7 +161,7 @@ export function SecretDetail({ workspaceId, credentialId }: SecretDetailProps) {
   if (error && !(isApiClientError(error) && error.status === 404)) {
     return (
       <CredentialDetailLayout back={back} actions={actions}>
-        <SettingsEmptyState variant='inline' tone='error'>
+        <SettingsEmptyState variant='inline'>
           {isApiClientError(error) && error.status === 403
             ? 'You do not have access to this secret.'
             : 'Could not load this secret.'}
@@ -292,7 +291,14 @@ export function SecretDetail({ workspaceId, credentialId }: SecretDetailProps) {
           </DetailSection>
         )}
 
-        {!isPersonal && <CredentialMembersSection credentialId={credential.id} isAdmin={isAdmin} />}
+        {!isPersonal && (
+          <CredentialMembersSection
+            credentialId={credential.id}
+            credentialName={credential.displayName}
+            isAdmin={isAdmin}
+            leaveHref={secretsHref}
+          />
+        )}
       </CredentialDetailLayout>
 
       {!isPersonal && (
@@ -302,12 +308,6 @@ export function SecretDetail({ workspaceId, credentialId }: SecretDetailProps) {
           onOpenChange={setIsShareModalOpen}
         />
       )}
-
-      <UnsavedChangesModal
-        open={form.showUnsavedAlert}
-        onOpenChange={form.setShowUnsavedAlert}
-        onDiscard={form.confirmDiscard}
-      />
     </>
   )
 }

@@ -15,6 +15,7 @@ import { Paperclip, Plus, Slash } from '@sim/emcn/icons'
 import { createLogger } from '@sim/logger'
 import { useParams } from 'next/navigation'
 import { getMothershipAttachmentPreviewUrl } from '@/lib/mothership/chat/attachment-preview'
+import { UNAVAILABLE_CONTEXT_NOTICE } from '@/lib/mothership/chat/context'
 import { MOTHERSHIP_ADD_CONTEXT_EVENT } from '@/lib/mothership/events'
 import { SIM_RESOURCE_DRAG_TYPE, SIM_RESOURCES_DRAG_TYPE } from '@/lib/mothership/resource-types'
 import { MOTHERSHIP_ACCEPT_ATTRIBUTE } from '@/lib/uploads/utils/validation'
@@ -30,12 +31,13 @@ import {
   SendButton,
   usePromptEditor,
 } from '@/app/workspace/[workspaceId]/home/components/user-input/components'
-import { ConversationModeSelector } from '@/app/workspace/[workspaceId]/home/components/user-input/components/conversation-mode-selector'
 import { InputToolbar } from '@/app/workspace/[workspaceId]/home/components/user-input/components/input-toolbar'
-import { useConversationModeShortcut } from '@/app/workspace/[workspaceId]/home/components/user-input/hooks/use-conversation-mode-shortcut'
+import type { ModelSelectorOptions } from '@/app/workspace/[workspaceId]/home/components/user-input/components/model-selector'
+import { usePromptHistory } from '@/app/workspace/[workspaceId]/home/components/user-input/hooks/use-prompt-history'
 import { handleMothershipAddContextEvent } from '@/app/workspace/[workspaceId]/home/components/user-input/mothership-context-event'
+import { useChatPlanRequired } from '@/app/workspace/[workspaceId]/home/hooks/use-chat-plan-required'
 import type {
-  ChatRequestMode,
+  ChatMessage,
   FileAttachmentForApi,
   MothershipResource,
   QueuedMessage,
@@ -44,8 +46,12 @@ import { useFileAttachments } from '@/app/workspace/[workspaceId]/w/[workflowId]
 import type { AttachedFile } from '@/app/workspace/[workspaceId]/w/[workflowId]/components/panel/components/copilot/components/user-input/hooks/use-file-attachments'
 import { mentionifyIntegrations } from '@/blocks/integration-matcher'
 import { useChatInputFocus } from '@/hooks/use-chat-input-focus'
+import { useComposerSubmission } from '@/hooks/use-composer-submission'
+import { useHydrated } from '@/hooks/use-hydrated'
+import { isMobileViewport } from '@/hooks/use-is-mobile'
 import { useSettingsNavigation } from '@/hooks/use-settings-navigation'
 import { useVoiceInput } from '@/hooks/use-voice-input'
+import { useChatPlanModalStore } from '@/stores/modals/chat-plan/store'
 import { type DraftPayload, useMothershipDraftsStore } from '@/stores/mothership-drafts/store'
 import type { ChatContext } from '@/stores/panel'
 
@@ -54,20 +60,27 @@ export type { FileAttachmentForApi } from '@/app/workspace/[workspaceId]/home/ty
 const logger = createLogger('UserInput')
 
 interface UserInputProps {
+  fileDropTarget?: React.RefObject<HTMLElement | null>
+  attachments?: React.ReactNode
+  resourceActions?: React.ReactNode
+  toolbarActions?: React.ReactNode
+  modelSelectorOptions?: ModelSelectorOptions
   requestMode?: 'agent' | 'plan'
-  onModeChange?: (mode: 'agent' | 'plan') => void
+  onPlanChange?: () => void
   defaultValue?: string
   draftScopeKey?: string
+  /** Returning false synchronously preserves the draft when a surface rejects submission. */
   onSubmit: (
     text: string,
     fileAttachments?: FileAttachmentForApi[],
     contexts?: ChatContext[]
-  ) => void
+  ) => unknown
   isSending: boolean
   onStopGeneration: () => void
   isInitialView?: boolean
   onSendQueuedHead?: () => void
-  onEditQueuedTail?: () => void
+  onEditQueuedTail?: () => boolean
+  getMessages?: () => readonly ChatMessage[]
 }
 
 export interface UserInputHandle {
@@ -87,8 +100,13 @@ export interface UserInputHandle {
  */
 const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserInput(
   {
+    fileDropTarget,
+    attachments,
+    resourceActions,
+    toolbarActions,
+    modelSelectorOptions,
     requestMode = 'agent',
-    onModeChange,
+    onPlanChange,
     defaultValue = '',
     draftScopeKey,
     onSubmit,
@@ -97,15 +115,18 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
     isInitialView = true,
     onSendQueuedHead,
     onEditQueuedTail,
+    getMessages,
   },
   ref
 ) {
   const { workspaceId } = useParams<{ workspaceId: string }>()
   const { navigateToSettings } = useSettingsNavigation()
   const { userId, onContextAdd, onContextRemove } = useChatSurface()
+  // Server HTML cannot see the stored draft; hydration renders without it and the mount restore applies it.
+  const canReadStoredDraft = useHydrated()
   const [initialValue] = useState(() => {
     if (defaultValue) return defaultValue
-    if (!draftScopeKey) return ''
+    if (!canReadStoredDraft || !draftScopeKey) return ''
     const text = useMothershipDraftsStore.getState().drafts[draftScopeKey]?.text
     return typeof text === 'string' ? text : ''
   })
@@ -113,6 +134,7 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
   const prevDefaultValueRef = useRef(defaultValue)
 
   const files = useFileAttachments({
+    fileDropTarget,
     userId,
     workspaceId,
   })
@@ -132,18 +154,15 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
     onContextAdd,
     onPasteFiles: handlePasteFiles,
   })
+  const history = usePromptHistory({
+    editor,
+    attachedFiles: files.attachedFiles,
+    restoreAttachedFiles: files.restoreAttachedFiles,
+    getMessages,
+  })
   const editorRef = useRef(editor)
   editorRef.current = editor
   const textareaRef = editor.textareaRef
-  const handleModeChange = (mode: ChatRequestMode) => {
-    if (mode === 'agent' || mode === 'plan') onModeChange?.(mode)
-  }
-  const handleModeShortcut = useConversationModeShortcut({
-    value: requestMode,
-    onChange: onModeChange ? handleModeChange : undefined,
-    textareaRef,
-    pickerOpen: editor.mentionQuery !== null || editor.slashQuery !== null,
-  })
   useChatInputFocus({ textareaRef })
 
   /**
@@ -199,19 +218,34 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
     }
     if (restoredContexts) editor.setContexts(restoredContexts)
     if (restoredFiles) files.restoreAttachedFiles(restoredFiles)
-    if (caretText !== null) {
+    // Text typed before hydration wins over the saved draft, caret included.
+    const typedBeforeHydration = initialValue === '' && editor.getValue() !== ''
+    if (caretText !== null && !typedBeforeHydration) {
+      if (initialValue === '') editor.setValue(caretText, { seed: true })
       const textarea = textareaRef.current
       if (textarea) {
-        textarea.focus()
+        if (!isMobileViewport()) textarea.focus()
         textarea.setSelectionRange(caretText.length, caretText.length)
       }
     }
-  }, []) // eslint-disable-line react-hooks/exhaustive-deps -- intentional mount-only restore
+  }, []) // intentional mount-only restore
 
   const isFirstSaveRef = useRef(true)
   const draftSaveTimerRef = useRef<number | null>(null)
   const pendingDraftRef = useRef<{ key: string; payload: DraftPayload } | null>(null)
+  const persistedDraftScopeRef = useRef(draftScopeKey)
   useEffect(() => {
+    const previousKey = persistedDraftScopeRef.current
+    if (previousKey !== draftScopeKey) {
+      if (draftSaveTimerRef.current !== null) {
+        window.clearTimeout(draftSaveTimerRef.current)
+        draftSaveTimerRef.current = null
+      }
+      if (previousKey && draftScopeKey)
+        useMothershipDraftsStore.getState().migrateDraft(previousKey, draftScopeKey)
+      pendingDraftRef.current = null
+      persistedDraftScopeRef.current = draftScopeKey
+    }
     if (isFirstSaveRef.current) {
       isFirstSaveRef.current = false
       return
@@ -242,7 +276,7 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
       pendingDraftRef.current = null
       draftSaveTimerRef.current = null
     }, 200)
-  }, [editor.value, files.attachedFiles, editor.contexts])
+  }, [draftScopeKey, editor.value, files.attachedFiles, editor.contexts])
 
   useEffect(
     () => () => {
@@ -262,6 +296,8 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
     const curr = editor.contexts
     const contextId = (ctx: ChatContext): string => {
       switch (ctx.kind) {
+        case 'browser_page':
+          return `browser_page:${ctx.snapshot.id}`
         case 'workflow':
         case 'current_workflow':
           return `${ctx.kind}:${ctx.workflowId}`
@@ -286,7 +322,12 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
     prevSelectedContextsRef.current = curr
   }, [editor.contexts])
 
-  const canSubmit = (editor.value.trim().length > 0 || hasFiles) && !isSending && !hasUploadingFiles
+  const hasAdditionalAttachments = Boolean(attachments)
+  const chatPlanRequired = useChatPlanRequired()
+  const canSubmit =
+    (editor.value.trim().length > 0 || hasFiles || hasAdditionalAttachments) &&
+    !isSending &&
+    !hasUploadingFiles
 
   /**
    * Sync the editor when the `defaultValue` prop changes post-mount — e.g.
@@ -352,7 +393,9 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
     () => ({
       loadQueuedMessage: (msg: QueuedMessage) => {
         const currentEditor = editorRef.current
-        currentEditor.setValue(msg.content)
+        history.reset()
+        const { hasUnavailableContexts } = currentEditor.restorePrompt(msg.content, msg.contexts)
+        if (hasUnavailableContexts) toast.info(UNAVAILABLE_CONTEXT_NOTICE)
         const restored: AttachedFile[] = (msg.fileAttachments ?? []).map((a) => ({
           id: a.id,
           name: a.filename,
@@ -364,7 +407,6 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
           previewUrl: getMothershipAttachmentPreviewUrl(a),
         }))
         filesRef.current.restoreAttachedFiles(restored)
-        currentEditor.setContexts(msg.contexts ?? [])
         currentEditor.focusAtEnd()
       },
       populatePrompt: (text: string) => {
@@ -476,6 +518,7 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
 
   /** Empties the text, chips, attachments, transcript, and the saved draft in one step. */
   const clearComposer = useCallback(() => {
+    history.reset()
     editorRef.current.clear()
     if (draftSaveTimerRef.current !== null) {
       window.clearTimeout(draftSaveTimerRef.current)
@@ -490,9 +533,17 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
     resetTranscript()
     filesRef.current.clearAttachedFiles()
     filesRef.current = { ...filesRef.current, attachedFiles: [] }
-  }, [resetTranscript])
+  }, [resetTranscript, history.reset])
 
+  const { pending: preparingSubmission, accept: acceptSubmission } = useComposerSubmission({
+    scope: draftScopeKey,
+    mode: requestMode,
+  })
   const handleSubmit = useCallback(() => {
+    if (chatPlanRequired) {
+      useChatPlanModalStore.getState().open(workspaceId)
+      return
+    }
     const currentFiles = filesRef.current
     const currentEditor = editorRef.current
 
@@ -511,13 +562,20 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
     // so the message reads as clean `/skill-name` (skills travel via contexts
     // regardless). Only the submitted copy is converted; the live input is not.
     const activeContexts = currentEditor.getActiveContexts()
-    onSubmit(
-      currentEditor.getPlainValue(),
-      fileAttachmentsForApi.length > 0 ? fileAttachmentsForApi : undefined,
-      activeContexts.length > 0 ? activeContexts : undefined
+    const raw = currentEditor.getValue()
+    acceptSubmission(
+      () =>
+        onSubmit(
+          currentEditor.getPlainValue(),
+          fileAttachmentsForApi.length > 0 ? fileAttachmentsForApi : undefined,
+          activeContexts.length > 0 ? activeContexts : undefined
+        ),
+      clearComposer,
+      () =>
+        editorRef.current.getValue() === raw &&
+        filesRef.current.attachedFiles === currentFiles.attachedFiles
     )
-    clearComposer()
-  }, [onSubmit, clearComposer])
+  }, [chatPlanRequired, workspaceId, onSubmit, clearComposer, acceptSubmission])
 
   /**
    * Enter policy for the editor: mirror canSubmit's uploading guard (Enter
@@ -528,6 +586,7 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
     if (filesRef.current.attachedFiles.some((f) => f.uploading)) return
     const hasSubmitPayload =
       editorRef.current.getValue().trim().length > 0 ||
+      hasAdditionalAttachments ||
       filesRef.current.attachedFiles.some((file) => !file.uploading && file.key)
     if (!hasSubmitPayload) {
       if (isSendingRef.current) {
@@ -536,19 +595,18 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
       return
     }
     handleSubmit()
-  }, [handleSubmit])
+  }, [handleSubmit, hasAdditionalAttachments])
 
   /**
    * ArrowUp-on-empty policy: recall the queued tail message for editing. Only
    * claims the key when there are no attachments and a queue handler exists.
    */
   const handleArrowUpOnEmpty = useCallback((): boolean => {
-    if (filesRef.current.attachedFiles.length > 0) return false
+    if (hasAdditionalAttachments || filesRef.current.attachedFiles.length > 0) return false
     const onEditQueuedTail = onEditQueuedTailRef.current
     if (!onEditQueuedTail) return false
-    onEditQueuedTail()
-    return true
-  }, [])
+    return onEditQueuedTail()
+  }, [hasAdditionalAttachments])
 
   const handlePlusClick = useCallback((e: React.MouseEvent<HTMLButtonElement>) => {
     const rect = e.currentTarget.getBoundingClientRect()
@@ -562,7 +620,6 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
   return (
     <div
       onClick={handleContainerClick}
-      onKeyDown={handleModeShortcut}
       onFocusCapture={() => {
         composerOwnsFocusRef.current = true
       }}
@@ -576,6 +633,8 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
         inter.className,
         isInitialView && 'shadow-ambient'
       )}
+      aria-busy={preparingSubmission || undefined}
+      inert={preparingSubmission}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDragOver={handleContainerDragOver}
@@ -585,19 +644,27 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
 
       <AttachedFilesList
         attachedFiles={files.attachedFiles}
+        additionalAttachments={attachments}
         onFileClick={handleFileClick}
         onRemoveFile={handleRemoveFile}
       />
 
       <PromptEditor
         editor={editor}
+        resourceActions={resourceActions}
+        aria-label='Message'
         placeholder='Ask Sim to '
         onSubmit={handleEnterSubmit}
         onArrowUpOnEmpty={handleArrowUpOnEmpty}
-        className={cn('max-h-[200px]', isInitialView && 'min-h-[56px]')}
+        onNavigateHistory={hasAdditionalAttachments ? undefined : history.navigate}
+        className={cn(
+          'max-h-[200px] max-md:max-h-[min(200px,calc(var(--mobile-viewport-height,100dvh)*0.25))]',
+          isInitialView && 'min-h-[56px] max-md:min-h-0'
+        )}
       />
 
       <InputToolbar
+        plan={requestMode === 'plan'}
         leadingControls={
           <>
             <Tooltip.Root>
@@ -633,11 +700,20 @@ const UserInputImpl = forwardRef<UserInputHandle, UserInputProps>(function UserI
               </Tooltip.Trigger>
               <Tooltip.Content side='top'>Skills</Tooltip.Content>
             </Tooltip.Root>
-            {onModeChange && (
-              <ConversationModeSelector value={requestMode} onChange={handleModeChange} />
+            {toolbarActions}
+            {onPlanChange && (
+              <Chip
+                shape='round'
+                active={requestMode === 'plan'}
+                aria-pressed={requestMode === 'plan'}
+                onClick={onPlanChange}
+              >
+                Plan
+              </Chip>
             )}
           </>
         }
+        modelSelectorOptions={modelSelectorOptions}
         voiceControl={
           isSttSupported && (
             <MicButton

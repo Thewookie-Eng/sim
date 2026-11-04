@@ -109,6 +109,7 @@ import { useResourceListPreferences } from '@/hooks/use-resource-list-preference
 import { useSearchFilterValue } from '@/hooks/use-search-filter-value'
 import { useUrlSort } from '@/hooks/use-url-sort'
 import type { WorkflowFolder } from '@/stores/folders/types'
+import { useInFlightUploadsStore } from '@/stores/in-flight-uploads/store'
 import type { ResourceListPreference } from '@/stores/resource-list-preferences'
 import { useImportTrayStore } from '@/stores/table/import-tray/store'
 
@@ -939,7 +940,7 @@ function TablesContent() {
       moveTable.mutate({ tableId: activeTable.id, folderId })
       closeRowContextMenu()
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- mutation objects are unstable; mutate is stable in v5
+    // mutation objects are unstable; mutate is stable in v5
     [activeTable, closeRowContextMenu]
   )
 
@@ -954,7 +955,7 @@ function TablesContent() {
         }
       )
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- mutation objects are unstable; mutate is stable in v5
+    // mutation objects are unstable; mutate is stable in v5
     [workspaceId]
   )
 
@@ -992,7 +993,7 @@ function TablesContent() {
         }
       )
     },
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- mutation objects are unstable; mutate is stable in v5
+    // mutation objects are unstable; mutate is stable in v5
     [clearSelection]
   )
 
@@ -1035,7 +1036,7 @@ function TablesContent() {
       // The mutation toasts the request failure itself; the modal stays open to allow a retry.
       logger.error('Failed to delete selected items:', err)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- mutation objects are unstable; mutateAsync is stable in v5
+    // mutation objects are unstable; mutateAsync is stable in v5
   }, [selectedTableIds, selectedFolderIds, clearSelection])
 
   /**
@@ -1126,7 +1127,7 @@ function TablesContent() {
     const mutation = pinned ? unpinItem : pinItem
     mutation.mutate({ workspaceId, resourceType: target.resourceType, resourceId: target.id })
     closeRowContextMenu()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- mutation objects are unstable; mutate is stable in v5
+    // mutation objects are unstable; mutate is stable in v5
   }, [
     workspaceId,
     contextMenuKind,
@@ -1175,6 +1176,7 @@ function TablesContent() {
       return
     }
 
+    const releaseUpload = useInFlightUploadsStore.getState().begin()
     try {
       setUploadProgress({ completed: 0, total: csvFiles.length })
       for (let index = 0; index < csvFiles.length; index++) {
@@ -1212,6 +1214,7 @@ function TablesContent() {
       logger.error('Error uploading CSV:', err)
       toast.error('Failed to import CSV')
     } finally {
+      releaseUpload()
       setUploadProgress({ completed: 0, total: 0 })
       if (csvInputRef.current) {
         csvInputRef.current.value = ''

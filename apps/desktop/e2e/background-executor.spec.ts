@@ -1,423 +1,69 @@
-import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
-import {
-  type ElectronApplication,
-  _electron as electron,
-  expect,
-  type Page,
-  test,
-} from '@playwright/test'
+import { type ElectronApplication, expect, test } from '@playwright/test'
 import type { SimDesktopApi } from '@sim/desktop-bridge'
 import { getErrorMessage } from '@sim/utils/errors'
 import { sleep } from '@sim/utils/helpers'
+import { recordCheck } from './check-report'
+import {
+  answerShellDialog,
+  type FixtureCall,
+  FixtureSim,
+  launch,
+  processRunning,
+  RECONCILE_MS,
+  readFileSafe,
+  refFor,
+  registeredDevice,
+  settled,
+  sha256,
+  WORKSPACE,
+} from './executor-sim'
 
 /**
  * The Sim desktop app's background executor against a fixture Sim that speaks the executor's
- * device protocol (register, inbox, doorbell, claim, lease, complete) the way Sim's routes do.
+ * device protocol (register, inbox, doorbell, claim, lease, complete, import) the way Sim's
+ * routes do.
  * The window navigates, reloads and leaves the chats while their calls run: nothing in this
- * suite depends on a chat view, which is the point. Each scenario's checks land in a JSON
- * report at BACKGROUND_EXECUTOR_REPORT_PATH.
+ * suite depends on a chat view, which is the point. Each check lands in a JSON report at
+ * BACKGROUND_EXECUTOR_REPORT_PATH as it finishes.
  */
 
-const DESKTOP_DIR = fileURLToPath(new URL('..', import.meta.url))
-const WORKSPACE = 'ws-e2e'
+/** Sim's window for a device to claim an offered call (DESKTOP_TOOL_PICKUP_GRACE_MS in Sim). */
+const SIM_PICKUP_GRACE_MS = 15_000
+
 const CHAT_A = 'chat-browser-a'
 const CHAT_B = 'chat-terminal-b'
 const CHAT_C = 'chat-idle-c'
-const LEASE_RENEW_MS = 1_000
-const RECONCILE_MS = 2_000
-
-type CallStatus = 'pending' | 'awaiting_approval' | 'running' | 'completed' | 'failed' | 'cancelled'
-
-interface Completion {
-  status: string
-  message: string
-  data?: Record<string, unknown>
-  outcome: 'recorded' | 'duplicate' | 'superseded'
-  at: number
-}
-
-interface FixtureCall {
-  toolCallId: string
-  toolName: string
-  args: Record<string, unknown>
-  chatId: string
-  deviceId: string
-  status: CallStatus
-  issuedAt: number
-  claimedAt?: number
-  token?: string
-  claims: number
-  renewals: number
-  completions: Completion[]
-  acknowledged: boolean
-}
-
-interface ReportCheck {
-  name: string
-  status: 'passed' | 'failed'
-  durationMs: number
-  error?: string
-}
-
-const report: ReportCheck[] = []
-
-class FixtureSim {
-  readonly calls = new Map<string, FixtureCall>()
-  readonly devices = new Map<string, { name: string; platform: string }>()
-  readonly requests: string[] = []
-  readonly hits = new Map<string, number>()
-  readonly streams = new Map<string, Set<ServerResponse>>()
-  enabled = true
-  offline = false
-  droppedWhileOffline = 0
-  private server: Server | null = null
-  origin = ''
-  private nextToken = 0
-
-  async start(): Promise<void> {
-    this.server = createServer((request, response) => {
-      void this.handle(request, response)
-    })
-    await new Promise<void>((resolve) => this.server?.listen(0, '127.0.0.1', resolve))
-    const address = this.server.address()
-    if (!address || typeof address === 'string') throw new Error('Missing fixture address')
-    this.origin = `http://127.0.0.1:${address.port}`
-  }
-
-  async stop(): Promise<void> {
-    for (const streams of this.streams.values()) for (const stream of streams) stream.destroy()
-    this.server?.closeAllConnections()
-    await new Promise<void>((resolve) => this.server?.close(() => resolve()))
-  }
-
-  reset(): void {
-    this.calls.clear()
-    this.devices.clear()
-    this.requests.length = 0
-    this.hits.clear()
-    this.enabled = true
-    this.offline = false
-    this.droppedWhileOffline = 0
-  }
-
-  /** Persists a call for a device and rings its doorbell, as Sim's pre-persist and offer do. */
-  issue(
-    deviceId: string,
-    chatId: string,
-    toolName: string,
-    args: Record<string, unknown>,
-    status: CallStatus = 'pending'
-  ): string {
-    const toolCallId = `call-${this.calls.size + 1}-${toolName}`
-    this.calls.set(toolCallId, {
-      toolCallId,
-      toolName,
-      args,
-      chatId,
-      deviceId,
-      status,
-      issuedAt: Date.now(),
-      claims: 0,
-      renewals: 0,
-      completions: [],
-      acknowledged: false,
-    })
-    this.ring(deviceId, status === 'awaiting_approval' ? 'approval' : 'call')
-    return toolCallId
-  }
-
-  /** Stop from any surface: Sim settles the call and tells the device to cancel. */
-  stopCall(toolCallId: string): void {
-    const call = this.requireCall(toolCallId)
-    call.status = 'cancelled'
-    this.ring(call.deviceId, 'cancel')
-  }
-
-  approve(toolCallId: string): void {
-    const call = this.requireCall(toolCallId)
-    call.status = 'pending'
-    this.ring(call.deviceId, 'approval')
-  }
-
-  requireCall(toolCallId: string): FixtureCall {
-    const call = this.calls.get(toolCallId)
-    if (!call) throw new Error(`No fixture call ${toolCallId}`)
-    return call
-  }
-
-  ring(deviceId: string, reason: string): void {
-    for (const stream of this.streams.get(deviceId) ?? []) {
-      stream.write(`event: inbox_changed\ndata: ${JSON.stringify({ reason })}\n\n`)
-    }
-  }
-
-  private async body(request: IncomingMessage): Promise<Record<string, unknown>> {
-    let text = ''
-    for await (const chunk of request) text += chunk.toString()
-    return text ? (JSON.parse(text) as Record<string, unknown>) : {}
-  }
-
-  private json(response: ServerResponse, status: number, body: unknown): void {
-    response.writeHead(status, { 'Content-Type': 'application/json' })
-    response.end(JSON.stringify(body))
-  }
-
-  private signedIn(request: IncomingMessage): boolean {
-    return request.headers.cookie?.includes('better-auth.session_token=fixture') ?? false
-  }
-
-  private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
-    const url = new URL(request.url ?? '/', this.origin)
-    const path = url.pathname
-    this.requests.push(`${request.method} ${path}`)
-    if (path.startsWith('/api/desktop/') && this.offline) {
-      this.droppedWhileOffline += 1
-      request.socket.destroy()
-      return
-    }
-    if (path === '/api/auth/get-session') {
-      this.json(
-        response,
-        200,
-        this.signedIn(request) ? { user: { id: 'user-e2e' }, session: { id: 'session-e2e' } } : null
-      )
-      return
-    }
-    if (path.startsWith('/api/desktop/') && !this.signedIn(request)) {
-      this.json(response, 401, { error: 'Unauthorized' })
-      return
-    }
-    if (path === '/api/desktop/devices' && request.method === 'POST') {
-      const body = await this.body(request)
-      if (this.enabled) {
-        this.devices.set(String(body.deviceId), {
-          name: String(body.name),
-          platform: String(body.platform),
-        })
-      }
-      this.json(response, 200, {
-        enabled: this.enabled,
-        protocolVersion: 1,
-        leaseMs: 60_000,
-        leaseRenewMs: LEASE_RENEW_MS,
-        reconcileMs: RECONCILE_MS,
-      })
-      return
-    }
-    const deviceId = url.searchParams.get('deviceId')
-    if (path === '/api/desktop/inbox/stream') {
-      if (!deviceId || !this.devices.has(deviceId)) {
-        this.json(response, 401, { error: 'Unregistered' })
-        return
-      }
-      response.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' })
-      response.write(': connected\n\n')
-      const streams = this.streams.get(deviceId) ?? new Set<ServerResponse>()
-      streams.add(response)
-      this.streams.set(deviceId, streams)
-      request.on('close', () => streams.delete(response))
-      return
-    }
-    if (path === '/api/desktop/inbox') {
-      if (!deviceId || !this.devices.has(deviceId)) {
-        this.json(response, 401, { error: 'Unregistered' })
-        return
-      }
-      const items = [...this.calls.values()]
-        .filter((call) => call.deviceId === deviceId)
-        .flatMap((call) => {
-          if (call.status === 'pending' && !call.token)
-            return [
-              {
-                kind: 'call',
-                toolCallId: call.toolCallId,
-                toolName: call.toolName,
-                chatId: call.chatId,
-                workspaceId: WORKSPACE,
-                createdAt: new Date(call.issuedAt).toISOString(),
-              },
-            ]
-          if (call.status === 'awaiting_approval')
-            return [
-              {
-                kind: 'approval_needed',
-                toolCallId: call.toolCallId,
-                toolName: call.toolName,
-                chatId: call.chatId,
-                chatTitle: 'Fix CI',
-                workspaceId: WORKSPACE,
-                summary: String((call.args.args as { command?: string } | undefined)?.command),
-              },
-            ]
-          if (call.token && call.status === 'cancelled' && !call.acknowledged)
-            return [{ kind: 'cancel', toolCallId: call.toolCallId }]
-          return []
-        })
-      this.json(response, 200, { items })
-      return
-    }
-    if (path.startsWith('/api/desktop/tool/')) {
-      const body = await this.body(request)
-      const call = this.calls.get(String(body.toolCallId))
-      if (!call || call.deviceId !== body.deviceId) {
-        this.json(response, 404, { error: 'Desktop tool call not found' })
-        return
-      }
-      if (path === '/api/desktop/tool/claim') {
-        if (call.status !== 'pending' || call.token) {
-          this.json(response, 404, { error: 'This call is no longer waiting for this device' })
-          return
-        }
-        call.claims += 1
-        call.status = 'running'
-        call.claimedAt = Date.now()
-        call.token = `token-${++this.nextToken}`
-        this.json(response, 200, {
-          toolName: call.toolName,
-          args: call.args,
-          chatId: call.chatId,
-          workspaceId: WORKSPACE,
-          executionToken: call.token,
-        })
-        return
-      }
-      if (body.executionToken !== call.token) {
-        this.json(response, 404, { error: 'Desktop tool call not found' })
-        return
-      }
-      if (path === '/api/desktop/tool/lease') {
-        call.renewals += 1
-        if (call.status !== 'running') {
-          this.json(response, 410, { error: 'This call was stopped or settled. Stop running it.' })
-          return
-        }
-        this.json(response, 200, { renewed: true })
-        return
-      }
-      if (path === '/api/desktop/tool/complete') {
-        const status = String(body.status)
-        const settled =
-          status === 'success' ? 'completed' : status === 'cancelled' ? 'cancelled' : 'failed'
-        const outcome =
-          call.status === 'running'
-            ? 'recorded'
-            : call.completions.length > 0
-              ? 'duplicate'
-              : 'superseded'
-        if (outcome === 'recorded') call.status = settled
-        if (call.status === 'cancelled') call.acknowledged = true
-        call.completions.push({
-          status,
-          message: String(body.message ?? ''),
-          ...(body.data && typeof body.data === 'object'
-            ? { data: body.data as Record<string, unknown> }
-            : {}),
-          outcome,
-          at: Date.now(),
-        })
-        this.json(response, 200, {
-          outcome,
-          status: call.status === 'running' ? settled : call.status,
-        })
-        return
-      }
-    }
-    if (path === '/hit') {
-      const chat = url.searchParams.get('chat') ?? ''
-      this.hits.set(chat, (this.hits.get(chat) ?? 0) + 1)
-      this.json(response, 200, { count: this.hits.get(chat) })
-      return
-    }
-    response.writeHead(200, {
-      'Content-Type': 'text/html',
-      'Set-Cookie': 'better-auth.session_token=fixture; HttpOnly; SameSite=Lax; Path=/',
-    })
-    response.end(
-      path === '/counter'
-        ? `<!doctype html><title>Counter ${url.searchParams.get('chat')}</title>
-<button onclick="fetch('/hit?chat=${url.searchParams.get('chat')}').then(r => r.json()).then(b => { document.getElementById('count').textContent = String(b.count) })">Count visit</button>
-<p id="count">0</p>`
-        : `<!doctype html><title>Sim fixture</title><h1>${path}</h1>`
-    )
-  }
-}
 
 const sim = new FixtureSim()
 
-async function launch(userData: string): Promise<{ app: ElectronApplication; window: Page }> {
-  const app = await electron.launch({
-    args: [process.env.SIM_DESKTOP_E2E_MAIN ?? '.'],
-    cwd: DESKTOP_DIR,
-    env: {
-      ...process.env,
-      SIM_DESKTOP_ORIGIN: sim.origin,
-      SIM_DESKTOP_USER_DATA: userData,
-    },
-  })
-  const window = await app.firstWindow()
-  return { app, window }
-}
-
-/** The device this app registered, once it has opened its doorbell. */
-async function registeredDevice(knownDevices: ReadonlySet<string> = new Set()): Promise<string> {
-  let deviceId: string | undefined
-  await expect
-    .poll(
-      () => {
-        deviceId = [...sim.devices.keys()].find(
-          (id) => !knownDevices.has(id) && (sim.streams.get(id)?.size ?? 0) > 0
-        )
-        return deviceId
-      },
-      { timeout: 30_000 }
-    )
-    .toBeTruthy()
-  return deviceId as string
-}
-
-async function settled(toolCallId: string, timeout = 60_000): Promise<Completion> {
-  await expect
-    .poll(() => sim.requireCall(toolCallId).completions.length, { timeout })
-    .toBeGreaterThan(0)
-  return sim.requireCall(toolCallId).completions[0] as Completion
-}
-
+/** Runs one check and adds its outcome to the report as soon as it is known. */
 async function check(name: string, body: () => Promise<void>): Promise<void> {
   const startedAt = Date.now()
+  const record = (status: 'passed' | 'failed', error?: unknown) =>
+    recordCheck(process.env.BACKGROUND_EXECUTOR_REPORT_PATH, 'background-executor', {
+      name,
+      status,
+      durationMs: Date.now() - startedAt,
+      retry: test.info().retry,
+      ...(error === undefined ? {} : { error: getErrorMessage(error) }),
+    })
   try {
     await body()
-    report.push({ name, status: 'passed', durationMs: Date.now() - startedAt })
+    record('passed')
   } catch (error) {
-    report.push({
-      name,
-      status: 'failed',
-      durationMs: Date.now() - startedAt,
-      error: getErrorMessage(error),
-    })
+    record('failed', error)
     throw error
-  }
-}
-
-function refFor(outline: string, name: string): number {
-  const match = outline
-    .split('\n')
-    .find((line) => line.includes(`"${name}"`) && /\[ref=\d+\]/.test(line))
-    ?.match(/\[ref=(\d+)\]/)
-  if (!match) throw new Error(`No reference for ${name}: ${outline}`)
-  return Number(match[1])
-}
-
-function processRunning(pattern: string): boolean {
-  try {
-    execFileSync('pgrep', ['-f', pattern])
-    return true
-  } catch {
-    return false
   }
 }
 
@@ -436,24 +82,18 @@ test.describe('background executor', () => {
 
   test.afterAll(async () => {
     await sim.stop()
-    const reportPath = process.env.BACKGROUND_EXECUTOR_REPORT_PATH
-    if (reportPath) {
-      writeFileSync(
-        reportPath,
-        JSON.stringify({ suite: 'background-executor', checks: report }, null, 2)
-      )
-    }
   })
 
   test('A: two chats run browser and terminal work while the user is elsewhere and reloads', async () => {
     const userData = mkdtempSync(join(tmpdir(), 'sim-executor-a-'))
-    const launched = await launch(userData)
+    const launched = await launch(sim, userData)
     app = launched.app
     const window = launched.window
-    const deviceId = await registeredDevice()
+    const deviceId = await registeredDevice(sim)
     await window.goto(`${sim.origin}/workspace/${WORKSPACE}/chat/${CHAT_C}`)
 
     const marker = join(userData, 'terminal-marker.txt')
+    const releaseCommands = join(userData, 'release-commands')
     const readable = join(userData, 'notes.txt')
     writeFileSync(readable, 'background read fixture')
 
@@ -461,7 +101,7 @@ test.describe('background executor', () => {
       const opened = sim.issue(deviceId, CHAT_A, 'browser_open_url', {
         url: `${sim.origin}/counter?chat=A`,
       })
-      const completion = await settled(opened)
+      const completion = await settled(sim, opened)
       expect(completion.status, completion.message).toBe('success')
     })
     const opened = [...sim.calls.values()][0] as FixtureCall
@@ -474,18 +114,53 @@ test.describe('background executor', () => {
     const terminalRuns = [1, 2, 3].map((n) =>
       sim.issue(deviceId, CHAT_B, 'terminal', {
         operation: 'run',
-        args: { command: `sleep 1; echo B-${n} >> '${marker}'`, waitSeconds: 30 },
+        args: {
+          command: `until [ -e '${releaseCommands}' ]; do sleep 0.1; done; echo B-${n} >> '${marker}'`,
+          waitSeconds: 30,
+        },
       })
     )
+    const readConsent = launched.app.waitForEvent('window')
     const localRead = sim.issue(deviceId, CHAT_B, 'read_local_file', { path: readable })
+    try {
+      await answerShellDialog(await readConsent, 'Allow folder')
 
-    await window.goto(`${sim.origin}/workspace/ws-other/home`)
-    await window.reload()
-    await window.goto(`${sim.origin}/workspace/${WORKSPACE}/chat/${CHAT_C}`)
+      await window.goto(`${sim.origin}/workspace/ws-other/home`)
+      await window.reload()
+      await window.goto(`${sim.origin}/workspace/${WORKSPACE}/chat/${CHAT_C}`)
+
+      // Chat B's first command holds its queue until released, so a claim that waited for the
+      // calls ahead of it to run could never happen in time.
+      await check("A: every call is claimed while chat B's first command still runs", async () => {
+        await expect
+          .poll(
+            () =>
+              [...sim.calls.values()]
+                .filter((call) => call.claimedAt === undefined)
+                .map((call) => call.toolCallId),
+            { timeout: SIM_PICKUP_GRACE_MS }
+          )
+          .toEqual([])
+        for (const call of sim.calls.values()) {
+          expect(
+            (call.claimedAt ?? Number.POSITIVE_INFINITY) - call.issuedAt,
+            call.toolCallId
+          ).toBeLessThan(SIM_PICKUP_GRACE_MS)
+        }
+      })
+
+      await check('A: the lease is renewed while calls wait and run', async () => {
+        await expect
+          .poll(() => terminalRuns.filter((id) => sim.requireCall(id).renewals === 0))
+          .toEqual([])
+      })
+    } finally {
+      writeFileSync(releaseCommands, '')
+    }
 
     await check('A: every call completes exactly once with its own token', async () => {
       for (const id of [...clicks, ...terminalRuns, localRead]) {
-        const completion = await settled(id, 90_000)
+        const completion = await settled(sim, id, 90_000)
         const call = sim.requireCall(id)
         expect(completion.status, `${call.toolName}: ${completion.message}`).toBe('success')
         expect(completion.outcome).toBe('recorded')
@@ -506,7 +181,7 @@ test.describe('background executor', () => {
 
     await check("A: chat B cannot see chat A's tabs", async () => {
       const listed = sim.issue(deviceId, CHAT_B, 'browser_list_tabs', {})
-      const completion = await settled(listed)
+      const completion = await settled(sim, listed)
       expect(JSON.stringify(completion.data)).not.toContain('/counter')
     })
 
@@ -516,53 +191,218 @@ test.describe('background executor', () => {
         sim.requests.filter((request) => request.includes('/api/desktop/tool/authorize'))
       ).toEqual([])
     })
+  })
 
-    await check('A: calls are picked up within 1.5 s at p95', async () => {
-      const latencies = [...sim.calls.values()]
-        .map((call) => (call.claimedAt ?? Number.POSITIVE_INFINITY) - call.issuedAt)
-        .sort((a, b) => a - b)
-      const p95 = latencies[Math.ceil(latencies.length * 0.95) - 1] ?? Number.POSITIVE_INFINITY
-      expect(p95).toBeLessThan(1_500)
+  test('background file reads require consent and Stop cancels pending permission', async () => {
+    const userData = mkdtempSync(join(tmpdir(), 'sim-executor-consent-'))
+    const launched = await launch(sim, userData)
+    app = launched.app
+    const deviceId = await registeredDevice(sim)
+    const readable = join(userData, 'private.txt')
+    writeFileSync(readable, 'background consent fixture')
+
+    await check('background read stays pending until folder consent', async () => {
+      const shown = launched.app.waitForEvent('window', { timeout: 10_000 })
+      const call = sim.issue(deviceId, CHAT_B, 'read_local_file', { path: readable })
+      const prompt = await shown
+      await expect(prompt.getByRole('button', { name: 'Allow folder', exact: true })).toBeVisible()
+      expect(sim.requireCall(call).completions).toHaveLength(0)
+      await answerShellDialog(prompt, "Don't allow")
+      const completion = await settled(sim, call)
+      expect(completion.status).toBe('error')
+      expect(JSON.stringify(completion)).not.toContain('background consent fixture')
     })
 
-    await check('A: the lease is renewed while calls wait and run', async () => {
-      expect(Math.max(...terminalRuns.map((id) => sim.requireCall(id).renewals))).toBeGreaterThan(0)
+    await check('Stop dismisses background consent without granting access', async () => {
+      const shown = launched.app.waitForEvent('window', { timeout: 10_000 })
+      const call = sim.issue(deviceId, CHAT_B, 'read_local_file', { path: readable })
+      const prompt = await shown
+      await expect(prompt.getByRole('button', { name: 'Allow folder', exact: true })).toBeVisible()
+      sim.stopCall(call)
+      await expect.poll(() => prompt.isClosed()).toBe(true)
+      await settled(sim, call)
+      expect(sim.requireCall(call).completions[0]?.outcome).toBe('superseded')
+    })
+
+    await check('approved background reads reuse the shared folder grant', async () => {
+      const shown = launched.app.waitForEvent('window', { timeout: 10_000 })
+      const call = sim.issue(deviceId, CHAT_B, 'read_local_file', { path: readable })
+      const prompt = await shown
+      await answerShellDialog(prompt, 'Allow folder')
+      expect((await settled(sim, call)).status).toBe('success')
+      const next = sim.issue(deviceId, CHAT_A, 'read_local_file', { path: readable })
+      expect(JSON.stringify((await settled(sim, next)).data)).toContain(
+        'background consent fixture'
+      )
     })
   })
 
-  test('B: a result produced while offline is delivered once after reconnecting', async () => {
+  test('background consent cannot grant access when Sim cannot verify the call', async () => {
+    const userData = mkdtempSync(join(tmpdir(), 'sim-executor-offline-consent-'))
+    const launched = await launch(sim, userData)
+    app = launched.app
+    const deviceId = await registeredDevice(sim)
+    const readable = join(userData, 'private.txt')
+    writeFileSync(readable, 'offline consent fixture')
+
+    await check('offline approval returns an error without remembering a grant', async () => {
+      const shown = launched.app.waitForEvent('window')
+      const call = sim.issue(deviceId, CHAT_B, 'read_local_file', { path: readable })
+      const prompt = await shown
+      await expect(prompt.getByRole('button', { name: 'Allow folder', exact: true })).toBeVisible()
+      sim.disconnect()
+      await answerShellDialog(prompt, 'Allow folder')
+      await expect
+        .poll(() =>
+          launched.app.evaluate(({ safeStorage }, toolCallId) => {
+            const fs = process.getBuiltinModule('node:fs')
+            const path = `${process.env.SIM_DESKTOP_USER_DATA}/desktop-executor-journal.json`
+            const envelope = JSON.parse(fs.readFileSync(path, 'utf8'))
+            const journal = JSON.parse(
+              safeStorage.decryptString(Buffer.from(envelope.ciphertext, 'base64'))
+            ) as { entries: { toolCallId: string; state: string }[] }
+            return journal.entries.find((entry) => entry.toolCallId === toolCallId)?.state
+          }, call)
+        )
+        .toBe('result')
+      sim.reconnect()
+      const completion = await settled(sim, call)
+      expect(completion.status).toBe('error')
+      expect(JSON.stringify(completion)).not.toContain('offline consent fixture')
+      const nextPrompt = launched.app.waitForEvent('window')
+      const next = sim.issue(deviceId, CHAT_B, 'read_local_file', { path: readable })
+      await answerShellDialog(await nextPrompt, "Don't allow")
+      expect((await settled(sim, next)).status).toBe('error')
+    })
+  })
+
+  test('background consent does not reopen the main app after its windows are closed', async () => {
+    test.skip(process.platform !== 'darwin', 'The macOS app remains running without a window.')
+    const userData = mkdtempSync(join(tmpdir(), 'sim-executor-windowless-consent-'))
+    const launched = await launch(sim, userData)
+    app = launched.app
+    const deviceId = await registeredDevice(sim)
+    const readable = join(userData, 'private.txt')
+    writeFileSync(readable, 'windowless consent fixture')
+    await launched.window.close()
+
+    await check('only the standalone consent window opens for a background read', async () => {
+      const shown = launched.app.waitForEvent('window')
+      const call = sim.issue(deviceId, CHAT_B, 'read_local_file', { path: readable })
+      const prompt = await shown
+      await expect(prompt.getByRole('button', { name: 'Allow folder', exact: true })).toBeVisible()
+      expect(
+        await launched.app.evaluate(({ BrowserWindow }) =>
+          BrowserWindow.getAllWindows().map((window) => window.getParentWindow() === null)
+        )
+      ).toEqual([true])
+      await answerShellDialog(prompt, "Don't allow")
+      expect((await settled(sim, call)).status).toBe('error')
+    })
+  })
+
+  test('sign-out clears folder grants even when desktop settings cannot be saved', async () => {
+    const userData = mkdtempSync(join(tmpdir(), 'sim-executor-grant-cleanup-'))
+    const launched = await launch(sim, userData)
+    app = launched.app
+    const deviceId = await registeredDevice(sim)
+    const readable = join(userData, 'private.txt')
+    writeFileSync(readable, 'cleanup consent fixture')
+    const shown = launched.app.waitForEvent('window')
+    const call = sim.issue(deviceId, CHAT_B, 'read_local_file', { path: readable })
+    await answerShellDialog(await shown, 'Allow folder')
+    expect((await settled(sim, call)).status).toBe('success')
+    const grants = join(userData, 'local-filesystem-grants.json')
+    expect(existsSync(grants)).toBe(true)
+    await launched.window.evaluate(() => {
+      const button = document.createElement('button')
+      button.textContent = 'Enable full file access'
+      button.onclick = async () => {
+        const api = (globalThis as typeof globalThis & { simDesktop: SimDesktopApi }).simDesktop
+        await api.settings.setFullFileAccess?.(true)
+        button.textContent = 'Full file access enabled'
+      }
+      document.body.append(button)
+    })
+    await launched.window
+      .getByRole('button', { name: 'Enable full file access', exact: true })
+      .click()
+    await expect(
+      launched.window.getByRole('button', { name: 'Full file access enabled', exact: true })
+    ).toBeVisible()
+    const settings = join(userData, 'settings.json')
+    if (existsSync(settings)) renameSync(settings, `${settings}.backup`)
+    mkdirSync(settings)
+
+    try {
+      await check(
+        'failed settings persistence does not skip independent grant cleanup',
+        async () => {
+          const failedSignOut = launched.app.waitForEvent('window')
+          await launched.app.evaluate(({ Menu }) => {
+            const item = Menu.getApplicationMenu()
+              ?.items.flatMap((entry) => entry.submenu?.items ?? [])
+              .find((entry) => entry.label === 'Sign Out')
+            if (!item) throw new Error('Missing Sign Out menu item')
+            item.click()
+          })
+          const failure = await failedSignOut
+          await answerShellDialog(failure, 'OK')
+          expect(existsSync(join(userData, 'account-data-teardown-required.json'))).toBe(true)
+          await expect.poll(() => existsSync(grants)).toBe(false)
+        }
+      )
+    } finally {
+      rmSync(settings, { recursive: true, force: true })
+      if (existsSync(`${settings}.backup`)) renameSync(`${settings}.backup`, settings)
+    }
+  })
+
+  test('B: a result produced while the network is cut is delivered once after reconnecting', async () => {
     const userData = mkdtempSync(join(tmpdir(), 'sim-executor-b-'))
-    app = (await launch(userData)).app
-    const deviceId = await registeredDevice()
+    app = (await launch(sim, userData)).app
+    const deviceId = await registeredDevice(sim)
 
     const run = sim.issue(deviceId, CHAT_B, 'terminal', {
       operation: 'run',
       args: { command: 'sleep 2; echo offline-done', waitSeconds: 30 },
     })
     await expect.poll(() => sim.requireCall(run).claims).toBe(1)
-    sim.offline = true
-    await sleep(6_000)
+    sim.disconnect()
 
-    await check('B: nothing reached Sim while offline', async () => {
-      expect(sim.requireCall(run).completions).toHaveLength(0)
-      expect(sim.droppedWhileOffline).toBeGreaterThan(0)
-    })
-    sim.offline = false
+    await check(
+      'B: the cut drops the doorbell and nothing reaches Sim while it lasts',
+      async () => {
+        await expect.poll(() => sim.streams.get(deviceId)?.size ?? 0).toBe(0)
+        await expect.poll(() => sim.droppedWhileOffline, { timeout: 15_000 }).toBeGreaterThan(0)
+        await sleep(4_000)
+        expect(sim.requireCall(run).completions).toHaveLength(0)
+      }
+    )
+    sim.reconnect()
 
     await check('B: the result arrives once after reconnecting', async () => {
-      const completion = await settled(run, 60_000)
-      expect(completion.status).toBe('success')
+      const completion = await settled(sim, run, 60_000)
+      expect(completion.status, completion.message).toBe('success')
       expect(JSON.stringify(completion.data)).toContain('offline-done')
       await sleep(3_000)
       expect(sim.requireCall(run).completions).toHaveLength(1)
+      expect(sim.requireCall(run).claims).toBe(1)
+    })
+
+    await check('B: the device reopens its doorbell and picks up new work', async () => {
+      await expect.poll(() => sim.streams.get(deviceId)?.size ?? 0, { timeout: 45_000 }).toBe(1)
+      const after = sim.issue(deviceId, CHAT_B, 'browser_list_tabs', {})
+      const completion = await settled(sim, after)
+      expect(completion.status, completion.message).toBe('success')
     })
   })
 
   test('C: a crash mid-command reports the outcome as unknown and never reruns it', async () => {
     const userData = mkdtempSync(join(tmpdir(), 'sim-executor-c-'))
     const marker = join(userData, 'crash-marker.txt')
-    const first = await launch(userData)
-    const deviceId = await registeredDevice()
+    const first = await launch(sim, userData)
+    const deviceId = await registeredDevice(sim)
 
     const run = sim.issue(deviceId, CHAT_B, 'terminal', {
       operation: 'run',
@@ -572,10 +412,10 @@ test.describe('background executor', () => {
     first.app.process().kill('SIGKILL')
     sim.streams.get(deviceId)?.clear()
 
-    app = (await launch(userData)).app
+    app = (await launch(sim, userData)).app
 
     await check('C: the restarted app reports the lost result as outcome unknown', async () => {
-      const completion = await settled(run, 60_000)
+      const completion = await settled(sim, run, 60_000)
       expect(completion.data).toMatchObject({ outcomeUnknown: true, doNotRetry: true })
     })
 
@@ -585,15 +425,79 @@ test.describe('background executor', () => {
     })
   })
 
+  test('D: a folder import lands in Sim while the user is in another chat', async () => {
+    const userData = mkdtempSync(join(tmpdir(), 'sim-executor-d-'))
+    const launched = await launch(sim, userData)
+    app = launched.app
+    const deviceId = await registeredDevice(sim)
+    const source = join(userData, 'Reports')
+    mkdirSync(join(source, 'q3'), { recursive: true })
+    writeFileSync(join(source, 'notes.txt'), 'remember the numbers')
+    // Larger than one 8 MB read, so the file crosses Electron in several chunks.
+    const large = Buffer.alloc(9 * 1024 * 1024, 7)
+    writeFileSync(join(source, 'q3', 'export.bin'), large)
+    await launched.window.goto(`${sim.origin}/workspace/${WORKSPACE}/chat/${CHAT_C}`)
+
+    const importConsent = launched.app.waitForEvent('window')
+    const call = sim.issue(deviceId, CHAT_B, 'import_local_files', {
+      path: source,
+      targetWorkspaceId: WORKSPACE,
+      folderId: 'folder-e2e',
+    })
+
+    await answerShellDialog(await importConsent, 'Allow folder')
+
+    await check('D: the import completes with every entry it stored', async () => {
+      const completion = await settled(sim, call, 60_000)
+      expect(completion.status).toBe('success')
+      expect(completion.data).toMatchObject({
+        success: true,
+        workspaceId: WORKSPACE,
+        folders: [
+          { id: 'entry-1', relativePath: '' },
+          { id: 'entry-3', relativePath: 'q3' },
+        ],
+        files: [
+          { id: 'entry-2', relativePath: 'notes.txt' },
+          { id: 'entry-4', relativePath: 'q3/export.bin' },
+        ],
+      })
+    })
+
+    await check('D: Sim received the tree with the bytes on disk, once', async () => {
+      expect(sim.imported).toEqual([
+        { toolCallId: call, kind: 'directory', sourceName: 'Reports', relativePath: '' },
+        {
+          toolCallId: call,
+          kind: 'file',
+          sourceName: 'Reports',
+          relativePath: 'notes.txt',
+          sha256: sha256(Buffer.from('remember the numbers')),
+          bytes: 20,
+        },
+        { toolCallId: call, kind: 'directory', sourceName: 'Reports', relativePath: 'q3' },
+        {
+          toolCallId: call,
+          kind: 'file',
+          sourceName: 'Reports',
+          relativePath: 'q3/export.bin',
+          sha256: sha256(large),
+          bytes: large.length,
+        },
+      ])
+      expect(sim.requireCall(call).claims).toBe(1)
+    })
+  })
+
   test('E: Stop from another chat stops a running browser wait and terminal command', async () => {
     const userData = mkdtempSync(join(tmpdir(), 'sim-executor-e-'))
-    app = (await launch(userData)).app
-    const deviceId = await registeredDevice()
+    app = (await launch(sim, userData)).app
+    const deviceId = await registeredDevice(sim)
 
     const opened = sim.issue(deviceId, CHAT_A, 'browser_open_url', {
       url: `${sim.origin}/counter?chat=E`,
     })
-    await settled(opened)
+    await settled(sim, opened)
     const wait = sim.issue(deviceId, CHAT_A, 'browser_wait_for', {
       text: 'never appears',
       timeoutMs: 30_000,
@@ -611,8 +515,8 @@ test.describe('background executor', () => {
     sim.stopCall(run)
 
     await check('E: both stopped calls are acknowledged within seconds', async () => {
-      await settled(wait, 10_000)
-      await settled(run, 15_000)
+      await settled(sim, wait, 10_000)
+      await settled(sim, run, 15_000)
       expect(sim.requireCall(wait).completions[0]?.outcome).toBe('superseded')
       expect(sim.requireCall(run).completions[0]?.outcome).toBe('superseded')
       expect((sim.requireCall(wait).completions[0]?.at ?? 0) - stoppedAt).toBeLessThan(5_000)
@@ -625,7 +529,7 @@ test.describe('background executor', () => {
 
   test('F: a call waiting for approval in a background chat notifies, then runs once approved', async () => {
     const userData = mkdtempSync(join(tmpdir(), 'sim-executor-f-'))
-    app = (await launch(userData)).app
+    app = (await launch(sim, userData)).app
     await app.evaluate(({ Notification }) => {
       const shown: Array<{ title: string; body: string }> = []
       const target = globalThis as typeof globalThis & { __shownNotifications?: typeof shown }
@@ -634,7 +538,7 @@ test.describe('background executor', () => {
         shown.push({ title: this.title, body: this.body })
       }
     })
-    const deviceId = await registeredDevice()
+    const deviceId = await registeredDevice(sim)
 
     const gated = sim.issue(
       deviceId,
@@ -671,22 +575,54 @@ test.describe('background executor', () => {
     sim.approve(gated)
     const approvedAt = Date.now()
     await check('F: the approved call is claimed promptly and runs once', async () => {
-      const completion = await settled(gated)
+      const completion = await settled(sim, gated)
       expect((sim.requireCall(gated).claimedAt ?? 0) - approvedAt).toBeLessThan(1_500)
       expect(JSON.stringify(completion.data)).toContain('approved-run')
     })
   })
 
+  test('F: a call the user declines in a background chat never runs', async () => {
+    const userData = mkdtempSync(join(tmpdir(), 'sim-executor-f-declined-'))
+    const marker = join(userData, 'declined-marker.txt')
+    app = (await launch(sim, userData)).app
+    const deviceId = await registeredDevice(sim)
+    const pulls = () =>
+      sim.requests.filter((request) => request.startsWith('GET /api/desktop/inbox')).length
+    const claimAttempts = () =>
+      sim.requests.filter((request) => request === 'POST /api/desktop/tool/claim').length
+    const pullsBefore = pulls()
+    const claimAttemptsBefore = claimAttempts()
+
+    const gated = sim.issue(
+      deviceId,
+      CHAT_B,
+      'terminal',
+      { operation: 'run', args: { command: `echo ran >> '${marker}'`, waitSeconds: 30 } },
+      'awaiting_approval'
+    )
+    // The device has pulled its inbox and seen the call waiting for approval.
+    await expect.poll(pulls).toBeGreaterThan(pullsBefore)
+    sim.decline(gated)
+
+    await check('F: the declined call is never claimed, and its command never runs', async () => {
+      await sleep(RECONCILE_MS * 2)
+      // Attempts, not successful claims: the fixture refuses a declined call's claim itself.
+      expect(claimAttempts() - claimAttemptsBefore).toBe(0)
+      expect(sim.requireCall(gated).completions).toEqual([])
+      expect(readFileSafe(marker)).toBe('')
+    })
+  })
+
   test('G: only the device a turn is bound to claims its calls', async () => {
-    const first = await launch(mkdtempSync(join(tmpdir(), 'sim-executor-g1-')))
-    const firstDevice = await registeredDevice()
-    const second = await launch(mkdtempSync(join(tmpdir(), 'sim-executor-g2-')))
-    const secondDevice = await registeredDevice(new Set([firstDevice]))
+    const first = await launch(sim, mkdtempSync(join(tmpdir(), 'sim-executor-g1-')))
+    const firstDevice = await registeredDevice(sim)
+    const second = await launch(sim, mkdtempSync(join(tmpdir(), 'sim-executor-g2-')))
+    const secondDevice = await registeredDevice(sim, new Set([firstDevice]))
     app = first.app
 
     const call = sim.issue(firstDevice, CHAT_A, 'browser_list_tabs', {})
     await check('G: the bound device runs it and the other never claims it', async () => {
-      await settled(call)
+      await settled(sim, call)
       expect(sim.requireCall(call).claims).toBe(1)
       expect(
         sim.requests.filter((request) => request === 'POST /api/desktop/tool/claim').length
@@ -698,7 +634,7 @@ test.describe('background executor', () => {
 
   test('H: a device Sim has not enabled offers no binding', async () => {
     sim.enabled = false
-    const launched = await launch(mkdtempSync(join(tmpdir(), 'sim-executor-h-')))
+    const launched = await launch(sim, mkdtempSync(join(tmpdir(), 'sim-executor-h-')))
     app = launched.app
     await launched.window.goto(`${sim.origin}/workspace/${WORKSPACE}/chat/${CHAT_C}`)
     await expect.poll(() => sim.requests.includes('POST /api/desktop/devices')).toBe(true)
@@ -717,9 +653,9 @@ test.describe('background executor', () => {
 
     sim.enabled = true
     await launched.app.close()
-    const enabled = await launch(mkdtempSync(join(tmpdir(), 'sim-executor-h2-')))
+    const enabled = await launch(sim, mkdtempSync(join(tmpdir(), 'sim-executor-h2-')))
     app = enabled.app
-    const deviceId = await registeredDevice()
+    const deviceId = await registeredDevice(sim)
     await enabled.window.goto(`${sim.origin}/workspace/${WORKSPACE}/chat/${CHAT_C}`)
     await check('H: an enabled device offers itself for binding', async () => {
       const device = await enabled.window.evaluate(() =>
@@ -730,12 +666,114 @@ test.describe('background executor', () => {
       expect(device).toEqual({ deviceId, protocolVersion: 1 })
     })
   })
-})
 
-function readFileSafe(path: string): string {
-  try {
-    return readFileSync(path, 'utf8')
-  } catch {
-    return ''
-  }
-}
+  test('I: the agent yields its page while the user works in it, then takes it back', async () => {
+    app = (await launch(sim, mkdtempSync(join(tmpdir(), 'sim-executor-i-')))).app
+    const deviceId = await registeredDevice(sim)
+    const opened = sim.issue(deviceId, CHAT_A, 'browser_open_url', {
+      url: `${sim.origin}/counter?chat=I`,
+    })
+    const outline = ((await settled(sim, opened)).data?.snapshot as { outline: string }).outline
+    const button = refFor(outline, 'Count visit')
+
+    const typeInAgentPage = () =>
+      app?.evaluate(({ webContents }) => {
+        const page = webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL().includes('/counter?chat=I'))
+        page?.sendInputEvent({ type: 'keyDown', keyCode: 'Tab' })
+        page?.sendInputEvent({ type: 'keyUp', keyCode: 'Tab' })
+      })
+    await typeInAgentPage()
+    const click = sim.issue(deviceId, CHAT_A, 'browser_click', { elementId: button })
+    for (let i = 0; i < 4; i++) {
+      await sleep(500)
+      await typeInAgentPage()
+    }
+    const lastUserInputAt = Date.now()
+
+    await check('I: the click waits until the user stops, then runs once', async () => {
+      const completion = await settled(sim, click, 30_000)
+      expect(completion.status, completion.message).toBe('success')
+      expect(completion.at - lastUserInputAt).toBeGreaterThanOrEqual(3_000)
+      await expect.poll(() => sim.hits.get('I')).toBe(1)
+    })
+  })
+
+  test('I: an action the user never stops working long enough for does not run', async () => {
+    app = (await launch(sim, mkdtempSync(join(tmpdir(), 'sim-executor-i2-')))).app
+    const deviceId = await registeredDevice(sim)
+    const opened = sim.issue(deviceId, CHAT_A, 'browser_open_url', {
+      url: `${sim.origin}/counter?chat=I2`,
+    })
+    const outline = ((await settled(sim, opened)).data?.snapshot as { outline: string }).outline
+    const button = refFor(outline, 'Count visit')
+    const typeInAgentPage = () =>
+      app?.evaluate(({ webContents }) => {
+        const page = webContents
+          .getAllWebContents()
+          .find((contents) => contents.getURL().includes('/counter?chat=I2'))
+        page?.sendInputEvent({ type: 'keyDown', keyCode: 'Tab' })
+        page?.sendInputEvent({ type: 'keyUp', keyCode: 'Tab' })
+      })
+
+    await typeInAgentPage()
+    const click = sim.issue(deviceId, CHAT_A, 'browser_click', { elementId: button })
+    let typing = true
+    const keepTyping = (async () => {
+      while (typing) {
+        await typeInAgentPage()
+        await sleep(1_000)
+      }
+    })()
+
+    await check('I: the click reports it never ran, instead of timing out', async () => {
+      const completion = await settled(sim, click, 60_000)
+      typing = false
+      await keepTyping
+      expect(completion.status).toBe('error')
+      expect(completion.message).toContain('Not run: the user kept working in this page')
+      expect(completion.data).not.toMatchObject({ outcomeUnknown: true })
+      expect(sim.hits.get('I2') ?? 0).toBe(0)
+    })
+  })
+
+  test('J: the machine stays awake only while a chat has work running', async () => {
+    app = (await launch(sim, mkdtempSync(join(tmpdir(), 'sim-executor-j-')))).app
+    await app.evaluate(({ powerSaveBlocker }) => {
+      const log: string[] = []
+      const active = new Set<number>()
+      let next = 1
+      const target = globalThis as typeof globalThis & { __sleepBlocks?: string[] }
+      target.__sleepBlocks = log
+      powerSaveBlocker.start = (type) => {
+        log.push(`start:${type}`)
+        active.add(next)
+        return next++
+      }
+      powerSaveBlocker.stop = (id) => {
+        log.push('stop')
+        active.delete(id)
+        return true
+      }
+      powerSaveBlocker.isStarted = (id) => active.has(id)
+    })
+    const deviceId = await registeredDevice(sim)
+    const sleepLog = () =>
+      app?.evaluate(() => (globalThis as { __sleepBlocks?: string[] }).__sleepBlocks ?? [])
+
+    const run = sim.issue(deviceId, CHAT_B, 'terminal', {
+      operation: 'run',
+      args: { command: 'sleep 3; echo awake', waitSeconds: 30 },
+    })
+    await check('J: a blocker is held while the command runs', async () => {
+      await expect.poll(sleepLog, { timeout: 15_000 }).toEqual(['start:prevent-app-suspension'])
+    })
+    await check('J: it is released once the result is delivered', async () => {
+      await settled(sim, run)
+      await expect
+        .poll(sleepLog, { timeout: 10_000 })
+        .toEqual(['start:prevent-app-suspension', 'stop'])
+    })
+  })
+})

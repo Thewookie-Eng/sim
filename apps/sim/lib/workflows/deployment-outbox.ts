@@ -1,8 +1,9 @@
-import { AuditAction, AuditResourceType, recordAudit } from '@sim/audit'
+import { AuditAction, AuditResourceType, recordAuditOnce } from '@sim/audit'
 import type { PrincipalActor } from '@sim/auth/principal'
 import { db, workflowDeploymentVersion, workflow as workflowTable } from '@sim/db'
 import { outboxEvent, workspaceOperationReceipt } from '@sim/db/schema'
 import { createLogger } from '@sim/logger'
+import { toStringOrNull } from '@sim/utils/coerce'
 import { toError } from '@sim/utils/errors'
 import { and, eq } from 'drizzle-orm'
 import { NextRequest } from 'next/server'
@@ -47,6 +48,7 @@ import {
   NonRetryableDeploymentError,
   parseDeploymentReadiness,
 } from '@/lib/workflows/deployment-lifecycle'
+import { WORKFLOW_DEPLOYMENT_OUTBOX_EVENTS } from '@/lib/workflows/deployment-outbox-events'
 import {
   activateDeploymentOperation,
   beginDeploymentOperationActivation,
@@ -73,15 +75,6 @@ import { activateForkSyncProvenance } from '@/ee/workspace-forking/lib/promote/s
 import type { BlockState } from '@/stores/workflows/workflow/types'
 
 const logger = createLogger('WorkflowDeploymentOutbox')
-
-export const WORKFLOW_DEPLOYMENT_OUTBOX_EVENTS = {
-  PREPARE_V2: 'workflow.deployment.prepare.v2',
-  /** One-release rolling compatibility for events admitted by pre-v2 pods. */
-  SYNC_ACTIVE_SIDE_EFFECTS: 'workflow.deployment.sync-active-side-effects',
-  /** One-release rolling compatibility for cleanup admitted by pre-v2 pods. */
-  CLEANUP_INACTIVE_SIDE_EFFECTS: 'workflow.deployment.cleanup-inactive-side-effects',
-  CLEANUP_UNDEPLOYED_SIDE_EFFECTS: 'workflow.deployment.cleanup-undeployed-side-effects',
-} as const
 
 export const DEPLOYMENT_READINESS_COMPONENTS = ['webhooks', 'schedules', 'mcp'] as const
 
@@ -763,7 +756,7 @@ async function emitPostActivationSideEffects(params: {
   if (!params.checkpoints.auditEmitted) {
     params.context.signal.throwIfAborted()
     const isVersionActivation = params.operation.action === 'activate'
-    recordAudit({
+    await recordAuditOnce(`${params.operation.id}:deployment-audit`, {
       workspaceId: (params.workflow.workspaceId as string) || null,
       actorId: params.operation.actorId,
       action: isVersionActivation
@@ -1536,9 +1529,23 @@ function parseOptionalPrincipalActor(value: unknown): PrincipalActor | undefined
       serviceId,
       subjectUserId: parseRequiredString(record.subjectUserId, 'actor.subjectUserId'),
       delegationId: parseRequiredString(record.delegationId, 'actor.delegationId'),
+      ...parseOptionalActorRun(record),
     }
   }
   throw new Error(`Invalid deployment outbox actor kind: ${kind}`)
+}
+
+/** The workflow run an executor delegation acted for, kept so its audit stays traceable. */
+function parseOptionalActorRun(record: Record<string, unknown>): {
+  workflowId?: string
+  executionId?: string
+} {
+  const workflowId = toStringOrNull(record.workflowId)
+  const executionId = toStringOrNull(record.executionId)
+  return {
+    ...(workflowId ? { workflowId } : {}),
+    ...(executionId ? { executionId } : {}),
+  }
 }
 
 function parseDeploymentPreparationCheckpoints(value: unknown): DeploymentPreparationCheckpoints {

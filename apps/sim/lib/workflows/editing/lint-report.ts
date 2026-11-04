@@ -5,6 +5,7 @@ import { getTableById } from '@/lib/table/service'
 import {
   collectDanglingBlockOutputReferences,
   collectTableBlockFieldIssues,
+  collectUnquotedJsonStringReferences,
   collectWorkflowFieldIssues,
   collectWorkflowTableIds,
   hasWorkflowEntryBlock,
@@ -20,6 +21,11 @@ import {
   collectUnresolvedReferences,
   UNRESOLVABLE_AT_LINT_NOTE,
 } from '@/lib/workflows/editing/validation'
+import {
+  type ManualRunEntryIssue,
+  resolveManualRunEntry,
+} from '@/lib/workflows/triggers/manual-run'
+import { resolveStartCandidates } from '@/lib/workflows/triggers/triggers'
 
 const logger = createLogger('WorkflowLintReport')
 
@@ -50,6 +56,27 @@ export const EMPTY_GRAPH_NOTE =
  * finding — a cycle of non-trigger blocks has no orphan and no entry.
  */
 export const NO_ENTRY_BLOCK_NOTE = 'No entry block: nothing can start this workflow.'
+
+/**
+ * What the editor's Run button would refuse. A graph with no manual entry that
+ * a chat can still start is a chat workflow, valid for its trigger, so it is
+ * not reported; an empty graph has its own note.
+ */
+function collectManualRunIssue(
+  graph: Pick<WorkflowState, 'blocks' | 'edges'>
+): ManualRunEntryIssue | null {
+  const blocks = graph.blocks ?? {}
+  if (Object.keys(blocks).length === 0) return null
+  const entry = resolveManualRunEntry(blocks, graph.edges ?? [])
+  if (entry.ok) return null
+  if (
+    entry.issue.reason === 'no-trigger' &&
+    resolveStartCandidates(blocks, { execution: 'chat' }).length > 0
+  ) {
+    return null
+  }
+  return entry.issue
+}
 
 export interface WorkflowLintScope {
   workflowId: string
@@ -121,10 +148,14 @@ export async function buildWorkflowLintReport(
     ...(options.tables?.unresolvedReferences ?? []),
   ]
 
-  // Pure graph check, so it runs for every caller: a dangling block-output
+  // Pure graph checks, so they run for every caller: a dangling block-output
   // reference passes literal text through at run time on the surfaces that
-  // do not fail loudly (API bodies, agent prompts).
-  unresolvedReferences.push(...collectDanglingBlockOutputReferences(graph))
+  // do not fail loudly (API bodies, agent prompts), and an unquoted string
+  // reference makes a JSON field unparseable only once the block runs.
+  unresolvedReferences.push(
+    ...collectDanglingBlockOutputReferences(graph),
+    ...collectUnquotedJsonStringReferences(graph)
+  )
 
   if (scope.subjectUserId) {
     for (const collect of [collectUnresolvedReferences, collectUnresolvedAgentToolReferences]) {
@@ -201,6 +232,7 @@ export async function buildWorkflowLintReport(
     fieldIssues: collectWorkflowFieldIssues(graph.blocks),
     unresolvedReferences,
     tableFieldIssues,
+    manualRunIssue: collectManualRunIssue(graph),
     notes,
   }
 }

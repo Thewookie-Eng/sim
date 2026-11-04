@@ -18,8 +18,9 @@ import {
   createUnauthorizedResponse,
 } from '@/lib/mothership/request/http'
 import {
+  chatViewDesktopLeaseOwnerToken,
   getDesktopToolClaimOwner,
-  isDesktopToolCall,
+  isBackgroundDesktopToolCall,
   isLocalReadToolCall,
 } from '@/lib/mothership/tools/desktop-tools'
 
@@ -52,7 +53,7 @@ function refusedClaimResponse(
  * that they have not allowed.
  */
 export const POST = withRouteHandler(async (request: NextRequest) => {
-  const { userId, isAuthenticated } = await authenticateCopilotRequestSessionOnly()
+  const { userId, isAuthenticated, principal } = await authenticateCopilotRequestSessionOnly()
   if (!isAuthenticated || !userId) {
     return createUnauthorizedResponse()
   }
@@ -82,7 +83,7 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
     )
 
   const args = isRecordLike(toolCall.args) ? (toolCall.args as Record<string, unknown>) : {}
-  if (!isDesktopToolCall(toolCall.toolName, args)) {
+  if (!isBackgroundDesktopToolCall(toolCall.toolName, args)) {
     return NextResponse.json(
       { error: 'Tool call is not authorized for desktop execution' },
       { status: 403 }
@@ -114,11 +115,16 @@ export const POST = withRouteHandler(async (request: NextRequest) => {
           { status: 409 }
         )
       if (toolCall.status !== 'pending') return alreadyStarted()
+      // An import runs as long as its files take, so its claim takes a lease this session holds:
+      // the chat view renews it while the import runs. Reads finish in seconds and take none.
       const { outcome } = await claimDesktopToolCall({
         toolCallId: toolCall.toolCallId,
         runId: toolCall.runId,
         userId,
         claimedBy: DESKTOP_TOOL_CLAIM_OWNER.files,
+        ...(principal
+          ? { chatView: { ownerToken: chatViewDesktopLeaseOwnerToken(principal.sessionId) } }
+          : {}),
       })
       if (outcome !== 'claimed') return refusedClaimResponse(outcome, alreadyStarted)
     } else if (

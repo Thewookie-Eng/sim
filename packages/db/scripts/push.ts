@@ -5,18 +5,25 @@ import postgres, { type Sql } from 'postgres'
 
 const logger = createLogger('DatabasePush')
 const RECONCILIATION_COMMANDS = [
+  ['bun', '--env-file=.env', 'run', './scripts/reconcile-file-ownership.ts'],
+  ['bun', '--env-file=.env', 'run', './scripts/reconcile-project-membership.ts'],
   ['bun', '--env-file=.env', 'run', './scripts/reconcile-credential-group-resource-policies.ts'],
   ['bun', '--env-file=.env', 'run', './scripts/reconcile-oauth-provider.ts'],
   ['bun', '--env-file=.env', 'run', './script-migrations/0016_backfill_search_vectors.ts'],
-  ['bun', '--env-file=.env', 'run', './script-migrations/0019_tin_keyword_projection.ts'],
   ['bun', '--env-file=.env', 'run', './script-migrations/0021_embedding_search_connector.ts'],
   ['bun', '--env-file=.env', 'run', './script-migrations/0024_knowledge_projection_async.ts'],
-  ['bun', '--env-file=.env', 'run', './script-migrations/0025_scope_keyword_projections.ts'],
   ['bun', '--env-file=.env', 'run', './script-migrations/0026_user_table_schema_for_write.ts'],
+  ['bun', '--env-file=.env', 'run', './script-migrations/0030_retire_keyword_writers.ts'],
+  ['bun', '--env-file=.env', 'run', './script-migrations/0031_drop_keyword_tin.ts'],
 ]
 
-/** Keep preparation, Drizzle and reconcilers fenced without a session lock or a retained snapshot. */
-async function withRetirementFence(run: (signal: AbortSignal) => Promise<number>): Promise<number> {
+/** Reads, on the fence session, whether `--prepare` left a Project bootstrap for this push to finish. */
+type ProjectBootstrapProbe = () => Promise<boolean>
+
+/** Fences preparation, Drizzle and reconcilers from a concurrent migration run. */
+async function withMigrationFence(
+  run: (signal: AbortSignal, projectBootstrapPending: ProjectBootstrapProbe) => Promise<number>
+): Promise<number> {
   const rawUrl = process.env.DATABASE_URL
   if (!rawUrl) {
     logger.error('DATABASE_URL is required for schema push')
@@ -40,22 +47,17 @@ async function withRetirementFence(run: (signal: AbortSignal) => Promise<number>
     })
     return (await sql.begin('isolation level read committed read only', async (tx) => {
       // Simple protocol closes SELECT portals so concurrent index builds do not wait on their snapshots.
-      const [locks] = await tx<{ maintenance: boolean; migration: boolean }[]>`
-        SELECT pg_try_advisory_xact_lock(hashtextextended('sim:search-retirement-maintenance', 0)) AS maintenance,
-          pg_try_advisory_xact_lock(4961002270::bigint) AS migration`.simple()
-      if (!locks.maintenance || !locks.migration) {
-        logger.error('Another migration or retirement operation is active; retry schema push later')
+      const [lock] = await tx<{ migration: boolean }[]>`
+        SELECT pg_try_advisory_xact_lock(4961002270::bigint) AS migration`.simple()
+      if (!lock.migration) {
+        logger.error('A migration is running; retry schema push later')
         return 1
       }
-      const [state] = await tx<{ present: boolean }[]>`
-        SELECT to_regclass('public.search_retirement_state') IS NOT NULL AS present`.simple()
-      if (state.present) {
-        logger.error(
-          'Schema push is disabled after Search retirement starts, including completed retirement. Use reviewed versioned migrations; push reconcilers would restore retired projections'
-        )
-        return 1
-      }
-      return run(abort.signal)
+      return run(abort.signal, async () => {
+        const [state] = await tx<{ pending: boolean }[]>`
+          SELECT to_regclass('public.project_membership_rollout') IS NOT NULL AS pending`.simple()
+        return state.pending
+      })
     })) as number
   } catch (error) {
     logger.error(
@@ -89,11 +91,21 @@ export async function runPush(args: string[]): Promise<number> {
     return 1
   }
 
-  async function runCommands(signal?: AbortSignal): Promise<number> {
-    async function runCommand(command: string[]): Promise<number> {
+  async function runCommands(
+    signal?: AbortSignal,
+    projectBootstrapPending?: ProjectBootstrapProbe
+  ): Promise<number> {
+    async function runCommand(
+      command: string[],
+      env: Record<string, string> = {}
+    ): Promise<number> {
       signal?.throwIfAborted()
       const child = Bun.spawn(command, {
-        env: { ...process.env, SIM_DB_PUSH_RENAME_MODE: interactiveRenames ? 'prompt' : 'create' },
+        env: {
+          ...process.env,
+          SIM_DB_PUSH_RENAME_MODE: interactiveRenames ? 'prompt' : 'create',
+          ...env,
+        },
         stdin: 'inherit',
         stdout: 'inherit',
         stderr: 'inherit',
@@ -105,20 +117,42 @@ export async function runPush(args: string[]): Promise<number> {
       return code
     }
 
-    if (!help && args.includes('--force')) {
-      const code = await runCommand(['bun', '--env-file=.env', 'run', './scripts/prepare-push.ts'])
+    if (!help) {
+      const projectCode = await runCommand([
+        'bun',
+        '--env-file=.env',
+        'run',
+        './scripts/reconcile-project-membership.ts',
+        '--prepare',
+      ])
+      if (projectCode !== 0) return projectCode
+      const code = await runCommand([
+        'bun',
+        '--env-file=.env',
+        'run',
+        './scripts/prepare-push.ts',
+        ...(args.includes('--force') ? ['--force'] : []),
+      ])
       if (code !== 0) return code
     }
     const pushArgs = args.filter((arg) => arg !== '--interactive-renames')
     // Launch the installed CLI directly so losing the fence also terminates its database connection.
     const cli = fileURLToPath(new URL('bin.cjs', import.meta.resolve('drizzle-kit')))
-    const exitCode = await runCommand([
-      'bun',
-      cli,
-      'push',
-      '--config=./drizzle.config.ts',
-      ...pushArgs,
-    ])
+    const drizzlePush = ['bun', cli, 'push', '--config=./drizzle.config.ts', ...pushArgs]
+    if (!help && process.env.SIM_DEV_DB_PUSH === '1' && (await projectBootstrapPending?.())) {
+      /** The Project migration reads columns an older database gains only from this push. */
+      const code = await runCommand(drizzlePush, { SIM_DB_PUSH_PROJECT_BOOTSTRAP: '1' })
+      if (code !== 0) return code
+      const bootstrapCode = await runCommand([
+        'bun',
+        '--env-file=.env',
+        'run',
+        './scripts/reconcile-project-membership.ts',
+        '--bootstrap',
+      ])
+      if (bootstrapCode !== 0) return bootstrapCode
+    }
+    const exitCode = await runCommand(drizzlePush)
     if (exitCode !== 0 || help) return exitCode
 
     for (const command of RECONCILIATION_COMMANDS) {
@@ -127,7 +161,7 @@ export async function runPush(args: string[]): Promise<number> {
     }
     return 0
   }
-  return help ? runCommands() : withRetirementFence(runCommands)
+  return help ? runCommands() : withMigrationFence(runCommands)
 }
 
 if (import.meta.main) {

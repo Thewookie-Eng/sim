@@ -1,6 +1,7 @@
 import { useMemo, useSyncExternalStore } from 'react'
 import { isBrowserAgentAvailable } from '@/lib/browser-agent/transport'
 import { subscribeDesktopPreferences } from '@/lib/desktop'
+import { isIntegrationUsable } from '@/lib/integrations/access'
 import { isTerminalAvailable } from '@/lib/terminal/transport'
 import type { AvailableItem } from '@/app/workspace/[workspaceId]/home/components/mothership-view/components/add-resource-dropdown/resource-folder-tree'
 import {
@@ -17,9 +18,11 @@ import { useKnowledgeBasesQuery } from '@/hooks/queries/kb/knowledge'
 import { useLogsList } from '@/hooks/queries/logs'
 import { useMothershipChats } from '@/hooks/queries/mothership-chats'
 import { useTablesList } from '@/hooks/queries/tables'
+import { useWorkflowTests } from '@/hooks/queries/workflow-tests'
 import { useWorkflows } from '@/hooks/queries/workflows'
 import { useWorkspaceFileFolders } from '@/hooks/queries/workspace-file-folders'
-import { useWorkspaceFiles } from '@/hooks/queries/workspace-files'
+import { useWorkspaceFilePickerOptions } from '@/hooks/queries/workspace-files'
+import { useIntegrationAccess } from '@/hooks/use-integration-access'
 
 /**
  * Placeholder id for the Browser launcher row. It never names a resource: the
@@ -29,6 +32,12 @@ export const BROWSER_LAUNCHER_ID = 'browser'
 
 /** Placeholder id for the Terminal launcher row; the shell the desktop app opens becomes the tab. */
 export const TERMINAL_LAUNCHER_ID = 'terminal'
+
+/**
+ * Families the chat composer cannot attach: they open as resource tabs but have no chat
+ * context. Sim reads a test through its file, `tests/<name>.test.js`.
+ */
+export const COMPOSER_EXCLUDED_TYPES: readonly MothershipResourceType[] = ['test']
 
 export interface AvailableItemsByType {
   type: MothershipResourceType
@@ -65,7 +74,7 @@ interface UseAvailableResourcesOptions {
    *
    * Note this only defers the lists nothing else on the surface already needs —
    * the mothership tab bar independently resolves tab names from the workflow,
-   * table, file, knowledge-base, and folder lists, so those stay warm there.
+   * table, knowledge-base, and folder lists, so those stay warm there.
    */
   enabled?: boolean
   /**
@@ -73,12 +82,24 @@ interface UseAvailableResourcesOptions {
    * (a module constant) — it keys the group memo.
    */
   excludeTypes?: readonly MothershipResourceType[]
+  /**
+   * The text the menu is filtering by, as typed. Files are not listed whole — a workspace can
+   * hold far more than a menu can show — so without a query the file family holds the most
+   * recently updated files, and once the typing settles, the server's ranked matches for it
+   * anywhere in the workspace (by name, word, fuzzy match, or folder path). Those carry the
+   * query as `matchedQuery`, and a caller keeps them as they are (`isServerMatchFor`) while it
+   * filters the other families — and files still answering an older query — by substring.
+   */
+  fileSearch?: string
 }
 
 /** Stable identity for the disabled result, so downstream memos never bust. */
 const NO_RESOURCE_GROUPS: AvailableItemsByType[] = []
 
 const LOG_DROPDOWN_LIMIT = 50
+
+/** How many of the most recently updated files a menu offers before anything is typed. */
+const RECENT_FILE_LIMIT = 100
 
 const LOG_DROPDOWN_FILTERS = {
   timeRange: 'All time' as const,
@@ -97,6 +118,7 @@ export function useAvailableResources(
   options?: UseAvailableResourcesOptions
 ): AvailableResources {
   const dashboardsEnabled = useFeatureFlag('dashboards')
+  const testsEnabled = useFeatureFlag('workflow-tests')
   const enabled = options?.enabled ?? true
   const excludeTypes = options?.excludeTypes
   const browserAvailable = useSyncExternalStore(
@@ -121,8 +143,16 @@ export function useAvailableResources(
   const { data: dashboardData, isPending: dashboardsPending } = useWorkspaceDashboard(workspaceId, {
     enabled: enabled && dashboardsEnabled && !excludeTypes?.includes('dashboard'),
   })
-  const { data: files, isPending: filesPending } = useWorkspaceFiles(workspaceId, 'active', {
-    enabled: enabled && Boolean(workspaceId),
+  const { data: tests, isPending: testsPending } = useWorkflowTests(workspaceId, {
+    enabled: enabled && testsEnabled && !excludeTypes?.includes('test'),
+  })
+  const {
+    files,
+    matchedQuery: fileMatchedQuery,
+    isPending: filesPending,
+  } = useWorkspaceFilePickerOptions(workspaceId, options?.fileSearch ?? '', {
+    limit: RECENT_FILE_LIMIT,
+    enabled,
   })
   const { data: knowledgeBases, isPending: knowledgeBasesPending } = useKnowledgeBasesQuery(
     workspaceId,
@@ -150,6 +180,23 @@ export function useAvailableResources(
   const { data: tasks, isPending: tasksPending } = useMothershipChats(workspaceId, {
     enabled: enabled && Boolean(workspaceId),
   })
+  const integrationsIncluded = !excludeTypes?.includes('integration')
+  const integrationAccess = useIntegrationAccess(workspaceId, {
+    enabled: enabled && integrationsIncluded,
+  })
+  const { getAccess: getIntegrationAccess } = integrationAccess
+
+  /**
+   * Only integrations the workspace can use now: the server drops a mention of
+   * one its policy restricts or whose OAuth this deployment has not configured.
+   */
+  const usableIntegrations = useMemo(
+    () =>
+      listIntegrationsByPopularity().filter((integration) =>
+        isIntegrationUsable(getIntegrationAccess(integration.blockType))
+      ),
+    [getIntegrationAccess]
+  )
   const { data: logsData, isPending: logsPending } = useLogsList(
     workspaceId,
     LOG_DROPDOWN_FILTERS,
@@ -172,6 +219,7 @@ export function useAvailableResources(
       tablesPending ||
       filesPending ||
       (dashboardsEnabled && !excludeTypes?.includes('dashboard') && dashboardsPending) ||
+      (testsEnabled && !excludeTypes?.includes('test') && testsPending) ||
       knowledgeBasesPending ||
       foldersPending ||
       (options?.includeFolderMentions &&
@@ -179,12 +227,14 @@ export function useAvailableResources(
           (!excludeTypes?.includes('knowledgebase') && knowledgeBaseFoldersPending))) ||
       fileFoldersPending ||
       tasksPending ||
-      logsPending)
+      logsPending ||
+      (integrationsIncluded && integrationAccess.isPending))
 
   const groups = useMemo(() => {
     if (!enabled) return NO_RESOURCE_GROUPS
     const excluded = new Set<MothershipResourceType>(excludeTypes ?? [])
     if (!dashboardsEnabled) excluded.add('dashboard')
+    if (!testsEnabled) excluded.add('test')
     const groups: AvailableItemsByType[] = [
       {
         type: 'workflow' as const,
@@ -219,8 +269,17 @@ export function useAvailableResources(
           : [],
       },
       {
+        type: 'test' as const,
+        items: (tests ?? []).map((test) => ({ id: test.name, name: test.title, folderId: null })),
+      },
+      {
         type: 'file' as const,
-        items: (files ?? []).map((f) => ({ id: f.id, name: f.name, folderId: f.folderId ?? null })),
+        items: (files ?? []).map((f) => ({
+          id: f.id,
+          name: f.name,
+          folderId: f.folderId ?? null,
+          ...(fileMatchedQuery ? { matchedQuery: fileMatchedQuery } : {}),
+        })),
       },
       {
         type: 'filefolder' as const,
@@ -240,7 +299,7 @@ export function useAvailableResources(
       },
       {
         type: 'integration' as const,
-        items: listIntegrationsByPopularity().map((integration) => ({
+        items: usableIntegrations.map((integration) => ({
           id: integration.blockType,
           name: integration.name,
           iconComponent: integration.icon,
@@ -310,12 +369,16 @@ export function useAvailableResources(
     fileFolders,
     tables,
     files,
+    fileMatchedQuery,
     dashboardData,
+    tests,
     knowledgeBases,
     tasks,
     logs,
+    usableIntegrations,
     excludeTypes,
     dashboardsEnabled,
+    testsEnabled,
   ])
 
   /**

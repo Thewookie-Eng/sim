@@ -12,6 +12,9 @@
  */
 export const APP_ENTRY_PATH = '/home'
 
+/** Keeps the landing page visible even when the viewer is signed in. */
+export const LANDING_HREF = '/?home'
+
 /**
  * The workspace picker: resolves to the viewer's most recent workspace. Use it only
  * where the viewer explicitly asked for workspaces; the default landing is
@@ -35,8 +38,17 @@ export function organizationRoutes(organizationId: string) {
     root,
     home: `${root}/home`,
     search: `${root}/search`,
+    searchChat: (chatId: string) => `${root}/search/chat/${chatId}`,
     integrations: `${root}/integrations`,
+    accountToolPermissions: (credentialId: string) =>
+      `${root}/integrations/accounts/${encodeURIComponent(credentialId)}`,
+    benchmark: `${root}/benchmark`,
     memberSecrets: `${root}/integrations/secrets`,
+    simLinks: `${root}/links`,
+    openSimLink: (name: string) =>
+      `/sim-links/${encodeURIComponent(organizationId)}/${encodeURIComponent(name)}`,
+    people: `${root}/people`,
+    person: (memberId: string) => `${root}/people/${encodeURIComponent(memberId)}`,
     organizationSecrets: `${root}/settings/integrations/secrets`,
     skills: `${root}/skills`,
     settings: `${root}/settings`,
@@ -49,7 +61,18 @@ export function organizationRoutes(organizationId: string) {
   } as const
 }
 
-function isPathOrDescendant(pathname: string, root: string): boolean {
+/** Where `sim/<name>/<values…>` resolves in this app: the address a member types, kept verbatim. */
+export function simLinkPath(...segments: string[]): string {
+  return ['/sim', ...segments.map(encodeURIComponent)].join('/')
+}
+
+/** The full address of `sim/<name>` on `origin`, which opens it with or without the extension. */
+export function simLinkUrl(origin: string, name: string): string {
+  return new URL(simLinkPath(name), origin).href
+}
+
+/** Whether `pathname` is `root` itself or a route beneath it. */
+export function isPathOrDescendant(pathname: string, root: string): boolean {
   return pathname === root || pathname.startsWith(`${root}/`)
 }
 
@@ -72,7 +95,9 @@ export function isAppSurfacePath(pathname: string): boolean {
  * upgrade utility pages.
  */
 const NOINDEX_PATH_ROOTS = [
+  '/sim',
   '/chat',
+  '/extension',
   '/resume',
   '/invite',
   '/unsubscribe',

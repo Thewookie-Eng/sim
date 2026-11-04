@@ -7,7 +7,11 @@
  * browser and reports the outcome via the confirm endpoint, which wakes the
  * server-side waiter.
  */
-import { type BrowserToolName, browserToolRendererTimeoutMs } from '@sim/browser-protocol'
+import {
+  BROWSER_TOOL_OBSERVES_ONLY,
+  type BrowserToolName,
+  browserToolRendererTimeoutMs,
+} from '@sim/browser-protocol'
 import {
   browserSessionClosedCompletion,
   browserToolCompletion,
@@ -34,6 +38,7 @@ import {
   reportClientToolCompletion,
   reportClientToolCompletionOnPageExit,
 } from '@/lib/mothership/tools/client/completion'
+import { compactCompletionForPageExit } from '@/lib/mothership/tools/client/page-exit-completion'
 import { getBrowserSession, useBrowserSessionStore } from '@/stores/browser-session/store'
 
 const logger = createLogger('CopilotBrowserToolExecution')
@@ -44,41 +49,7 @@ const logger = createLogger('CopilotBrowserToolExecution')
  * reload cannot cause a page or external side effect. Every stateful current
  * tool and the retired takeover flow remain fail-closed.
  */
-const OBSERVATION_ONLY_BROWSER_TOOLS = {
-  browser_navigate: false,
-  browser_open_url: false,
-  browser_go_back: false,
-  browser_go_forward: false,
-  browser_reload: false,
-  browser_open_tab: false,
-  browser_switch_tab: false,
-  browser_close_tab: false,
-  browser_list_tabs: true,
-  browser_list_sessions: true,
-  browser_list_downloads: true,
-  browser_save_download: false,
-  browser_wait_for: true,
-  browser_snapshot: true,
-  browser_find: true,
-  browser_read_text: true,
-  browser_screenshot: true,
-  browser_extract: true,
-  browser_click: false,
-  browser_click_at: false,
-  browser_type: false,
-  browser_fill_form: false,
-  browser_batch: false,
-  browser_insert_text: false,
-  browser_press_key: false,
-  browser_scroll: false,
-  browser_select_option: false,
-  browser_set_checked: false,
-  browser_upload_file: false,
-  browser_hover: false,
-  browser_drag: false,
-  browser_zoom: false,
-  browser_request_takeover: false,
-} as const satisfies Readonly<Record<BrowserToolName, boolean>>
+const OBSERVATION_ONLY_BROWSER_TOOLS = BROWSER_TOOL_OBSERVES_ONLY
 
 /** Tool events older than this are replays, not live instructions — never act on them. */
 const MAX_EVENT_AGE_MS = 120_000
@@ -86,7 +57,6 @@ const EXECUTED_STORAGE_PREFIX = 'sim:copilot:browser-tool-executed:'
 const EXECUTED_LEDGER_STORAGE_KEY = 'sim:copilot:browser-tool-executed-ledger:v1'
 const EXECUTED_LEDGER_MAX_ENTRIES = 2_048
 const EXECUTED_LEDGER_TTL_MS = 5 * 60_000
-const PAGE_EXIT_COMPLETION_MAX_BYTES = 48 * 1024
 const RETAINED_COMPLETION_MAX_BYTES = 8 * 1024
 const TERMINAL_COMPLETION_MAX_ACTIVE = 4
 const TERMINAL_COMPLETION_MAX_QUEUED = 64
@@ -125,27 +95,6 @@ interface RetainedTerminalCompletion {
   failureLog: string
   onPendingChange?: (completion: PendingTerminalCompletion | null) => void
   onRelease?: () => void
-}
-
-function compactCompletionForPageExit(
-  toolCallId: string,
-  completion: PendingTerminalCompletion
-): PendingTerminalCompletion {
-  const serialized = JSON.stringify({ toolCallId, ...completion })
-  if (new Blob([serialized]).size <= PAGE_EXIT_COMPLETION_MAX_BYTES) return completion
-
-  const data = toRecord(completion.data)
-  return {
-    status: completion.status,
-    message: truncate(completion.message, 1024),
-    data: {
-      ...(data.outcomeUnknown === true ? { outcomeUnknown: true } : {}),
-      ...(data.doNotRetry === true ? { doNotRetry: true } : {}),
-      ...(data.sessionClosed === true ? { sessionClosed: true } : {}),
-      resultOmittedDuringPageExit: true,
-      note: 'The browser action reached a known terminal state, but its full result was too large for unload-safe delivery. Do not repeat a side-effecting action. Take a fresh browser snapshot to recover current page state.',
-    },
-  }
 }
 
 function compactCompletionForRetry(

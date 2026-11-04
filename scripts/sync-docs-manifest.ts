@@ -11,7 +11,7 @@
  * Path derivation (each entry is BOTH the `docs/`-relative VFS path and the
  * docs.sim.ai URL path, so a read is a plain fetch of `https://docs.sim.ai/<entry>`):
  *   - `workflows/blocks/agent.mdx` → `workflows/blocks/agent.mdx`
- *   - `workflows/index.mdx`        → `workflows.mdx`   (fumadocs folds index pages
+ *   - `workflows/index.mdx`        → `workflows.mdx`   (the docs catalog folds index pages
  *                                     into their parent URL; `/workflows/index.mdx`
  *                                     is a 404 on the site)
  *
@@ -20,16 +20,13 @@
  * and the root `index.mdx` (its URL is `/`, which redirects).
  *
  * Usage:
- *   bun run docs-manifest:generate   # write the manifest
- *   bun run docs-manifest:check      # fail (exit 1) if the manifest is stale
+ *   bun run generate:docs-manifest   # write the manifest
+ *   bun run check:docs-manifest      # fail (exit 1) if the manifest is stale
  */
 import { readdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import {
-  foldDocsIndexPath,
-  UNMOUNTED_DOCS_SECTIONS,
-} from '../apps/sim/lib/mothership/docs/docs-path'
+import { foldDocsIndexPath, UNMOUNTED_DOCS_SECTIONS } from '../apps/sim/lib/mothership/docs/path'
 import { formatGeneratedSource } from './format-generated-source'
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
@@ -71,7 +68,7 @@ function render(paths: string[]): string {
   return `/**
  * AUTO-GENERATED FILE. DO NOT EDIT.
  * Generated from apps/docs/content/docs by scripts/sync-docs-manifest.ts.
- * Run: bun run docs-manifest:generate.
+ * Run: bun run generate:docs-manifest.
  *
  * Every page in the copilot's read-only \`docs/\` VFS tree, as a path that is
  * simultaneously the \`docs/\`-relative VFS path and the docs.sim.ai URL path
@@ -103,7 +100,7 @@ async function main() {
     const existing = await readFile(OUTPUT_PATH, 'utf8').catch(() => null)
     if (existing !== rendered) {
       throw new Error(
-        'Generated docs manifest is stale — the docs tree changed (page added, removed, or renamed). Run: bun run docs-manifest:generate'
+        'Generated docs manifest is stale — the docs tree changed (page added, removed, or renamed). Run: bun run generate:docs-manifest'
       )
     }
     return

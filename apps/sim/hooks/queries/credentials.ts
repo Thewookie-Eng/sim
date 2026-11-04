@@ -1,6 +1,6 @@
 'use client'
 
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { type QueryKey, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { requestJson } from '@/lib/api/client/request'
 import type { ContractBodyInput, ContractQueryInput } from '@/lib/api/contracts'
 import {
@@ -10,6 +10,7 @@ import {
   getSecretReferencesContract,
   getSecretUsageContract,
   getWorkspaceCredentialContract,
+  leaveCredentialMembershipContract,
   listWorkspaceCredentialMembersContract,
   removeWorkspaceCredentialMemberContract,
   type SecretUsageScope,
@@ -25,7 +26,7 @@ import {
   createOrganizationCredentialDraftContract,
 } from '@/lib/api/contracts/organization-credentials'
 import { environmentKeys } from '@/hooks/queries/environment'
-import { oauthConnectionsKeys } from '@/hooks/queries/oauth/oauth-connections'
+import { oauthConnectionsKeys } from '@/hooks/queries/oauth/connections'
 import { personalCredentialKeys } from '@/hooks/queries/personal-credentials'
 import { workspaceCredentialKeys } from '@/hooks/queries/utils/credential-keys'
 import { workspaceCredentialListQueryOptions } from '@/hooks/queries/utils/fetch-workspace-credentials'
@@ -33,7 +34,7 @@ import { invalidateSelectorQueries } from '@/hooks/queries/utils/selector-keys'
 
 /**
  * Key prefix for OAuth credential queries.
- * Duplicated here to avoid circular imports with oauth-credentials.ts.
+ * Duplicated here to avoid circular imports with oauth/credentials.ts.
  */
 const OAUTH_CREDENTIALS_KEY = ['oauthCredentials'] as const
 
@@ -308,6 +309,34 @@ export function useRemoveWorkspaceCredentialMember() {
         }),
         invalidateSelectorQueries(queryClient),
       ]),
+  })
+}
+
+/**
+ * Revokes the viewer's own membership of a credential. The caller navigates
+ * away from a credential the viewer can no longer read, so the affected caches
+ * are only marked stale — refetching them while the detail page is still
+ * mounted would flash "not found" — and whatever mounts next refetches them.
+ */
+export function useLeaveCredential() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: (credentialId: string) =>
+      requestJson(leaveCredentialMembershipContract, { query: { credentialId } }),
+    onSuccess: (_data, credentialId) => {
+      const staleKeys: QueryKey[] = [
+        workspaceCredentialKeys.lists(),
+        workspaceCredentialKeys.detail(credentialId),
+        OAUTH_CREDENTIALS_KEY,
+        environmentKeys.all,
+        oauthConnectionsKeys.connections(),
+      ]
+      for (const queryKey of staleKeys) {
+        queryClient.invalidateQueries({ queryKey, refetchType: 'none' })
+      }
+      invalidateSelectorQueries(queryClient)
+    },
   })
 }
 

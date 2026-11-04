@@ -3,7 +3,7 @@ export const RESOURCE_TAB_ICON_CLASS = 'size-[16px] text-[var(--text-icon)]'
 /** Shared geometry for the resource header and controls positioned over it. */
 export const RESOURCE_HEADER_CLASSES = {
   layout:
-    '[--resource-header-controls-height:40px] [--resource-header-end-inset:16px] [--resource-header-fixed-reserve:52px] [--resource-header-toggle-hit-size:40px] [--resource-header-toggle-size:30px]',
+    '[--resource-header-controls-height:40px] [--resource-header-end-inset:16px] [--resource-header-fixed-reserve:52px] [--resource-header-toggle-hit-size:40px] [--resource-header-toggle-size:30px] max-md:[--resource-header-controls-height:44px] max-md:[--resource-header-end-inset:8px] max-md:[--resource-header-toggle-hit-size:44px]',
   /**
    * Drives the tab strip from this header's own tokens rather than restating the
    * strip's defaults, so the height the overlaid controls below are positioned
@@ -32,6 +32,8 @@ export const RESOURCE_HEADER_CLASSES = {
    * to centre too or it lands a pixel below the row it belongs to.
    */
   overlay: 'absolute top-0 flex h-[var(--resource-header-controls-height)] items-center',
+  content:
+    'flex h-[var(--resource-header-controls-height)] shrink-0 items-center gap-1 pl-4 pr-[var(--resource-header-fixed-reserve)]',
   endPosition: 'right-[var(--resource-header-end-inset)]',
   /**
    * Clears the collapse toggle's 40px hit target so adjacent controls never

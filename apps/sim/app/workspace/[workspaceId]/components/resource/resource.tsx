@@ -15,6 +15,7 @@ import {
 import {
   Button,
   Checkbox,
+  Chip,
   cellIconNodeClass,
   chipActiveSurfaceClass,
   chipContentGap,
@@ -24,7 +25,7 @@ import {
   cn,
   Loader,
 } from '@sim/emcn'
-import { ChevronLeft, ChevronRight, Pin } from '@sim/emcn/icons'
+import { ChevronLeft, ChevronRight, MoreHorizontal, Pin } from '@sim/emcn/icons'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { InlineRenameInput } from '@/app/workspace/[workspaceId]/components/inline-rename-input'
 import { FloatingOverflowText } from '@/app/workspace/[workspaceId]/components/resource/components/floating-overflow-text'
@@ -32,6 +33,7 @@ import type { BreadcrumbDropConfig } from '@/app/workspace/[workspaceId]/compone
 import { ResourceHeader } from '@/app/workspace/[workspaceId]/components/resource/components/resource-header'
 import { ResourceOptions } from '@/app/workspace/[workspaceId]/components/resource/components/resource-options'
 import { SearchHighlight } from '@/app/workspace/[workspaceId]/components/search-highlight/search-highlight'
+import { useLoadMoreSentinel } from '@/hooks/use-load-more-sentinel'
 
 export interface ResourceColumn {
   id: string
@@ -151,12 +153,17 @@ const CHECKBOX_COLUMN_WIDTH = '52px'
  * virtualized grid layout reproduces the exact column widths. The checkbox
  * column, when present, is a fixed leading track.
  */
-function buildGridTemplateColumns(columns: ResourceColumn[], hasCheckbox: boolean): string {
+function buildGridTemplateColumns(
+  columns: readonly ResourceColumn[],
+  hasCheckbox: boolean
+): string {
   const weights = columns.map(
     (col, colIdx) => (colIdx === 0 ? 2.5 : 1.0) * (col.widthMultiplier ?? 1)
   )
-  const total = weights.reduce((s, w) => s + w, 0)
-  const tracks = columns.map((_, colIdx) => `minmax(0, ${(weights[colIdx] / total).toFixed(6)}fr)`)
+  const tracks = columns.map((_, colIdx) => {
+    const track = `minmax(0, ${weights[colIdx]}fr)`
+    return colIdx === 0 ? `var(--resource-table-name-width, ${track})` : track
+  })
   return hasCheckbox ? `${CHECKBOX_COLUMN_WIDTH} ${tracks.join(' ')}` : tracks.join(' ')
 }
 
@@ -186,7 +193,7 @@ interface ResourceProps {
 function ResourceRoot({ children, onContextMenu }: ResourceProps) {
   return (
     <div
-      className='relative flex h-full flex-1 flex-col overflow-hidden bg-[var(--bg)]'
+      className='relative flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-[var(--bg)]'
       onContextMenu={onContextMenu}
     >
       {children}
@@ -205,16 +212,19 @@ export interface ResourceTableHandle {
 }
 
 interface ResourceTableProps {
-  columns: ResourceColumn[]
+  columns: readonly ResourceColumn[]
   rows: ResourceRow[]
   selectedRowId?: string | null
   /** Optional imperative handle exposing {@link ResourceTableHandle} (e.g. for keyboard-nav scrolling). */
   apiRef?: RefObject<ResourceTableHandle | null>
   /**
    * Window the row list with `@tanstack/react-virtual`, keeping only the visible
-   * slice in the DOM. Opt-in because it removes off-screen rows — consumers that
-   * depend on every row being mounted (e.g. drag-and-drop drop targets) must stay
-   * on the full-DOM path. Enable it only for unbounded, accumulating lists (logs).
+   * slice in the DOM. Opt-in because it removes off-screen rows — a consumer that
+   * reaches rows through the DOM rather than its own row ids must stay on the
+   * full-DOM path. Row drag-and-drop works windowed: a drop target is only ever a
+   * row under the pointer, and the drag's teardown never depends on its source row
+   * staying mounted (`useDragTeardown`). Enable it only for unbounded, accumulating
+   * lists (logs, files).
    */
   virtualized?: boolean
   selectable?: SelectableConfig
@@ -224,7 +234,19 @@ interface ResourceTableProps {
   onRowContextMenu?: (e: React.MouseEvent, rowId: string) => void
   onLoadMore?: () => void
   hasMore?: boolean
+  /** The next page is loading: shows the spinner under the rows. */
   isLoadingMore?: boolean
+  /**
+   * Any request for the list is in flight, a background refetch included. Paging waits while it
+   * runs and asks again once it settles, so a sentinel reached mid-refetch is not left idle.
+   * Defaults to `isLoadingMore`.
+   */
+  isFetching?: boolean
+  /**
+   * The last next-page load failed. Paging then waits for the sentinel to leave view and come
+   * back before asking again, rather than retrying a failing request in a loop.
+   */
+  loadMoreFailed?: boolean
   pagination?: PaginationConfig
   /**
    * Sanctioned overlay slot. Rendered absolutely against the table region
@@ -279,12 +301,23 @@ const ResourceTable = memo(function ResourceTable({
   onLoadMore,
   hasMore,
   isLoadingMore,
+  isFetching = isLoadingMore,
+  loadMoreFailed = false,
   pagination,
   overlay,
   emptyState,
 }: ResourceTableProps) {
   const scrollRef = useRef<HTMLDivElement>(null)
-  const loadMoreRef = useRef<HTMLDivElement>(null)
+  /**
+   * Re-armed whenever a load settles: an observer only reports a change in intersection, so a
+   * sentinel still on screen after the rows it revealed (or a request it was refused during)
+   * would otherwise never ask again.
+   */
+  const loadMoreRef = useLoadMoreSentinel({
+    onLoadMore,
+    enabled: Boolean(hasMore) && !isFetching,
+    waitForReentry: loadMoreFailed,
+  })
 
   const showEmptyState = rows.length === 0 && Boolean(emptyState)
 
@@ -317,20 +350,6 @@ const ResourceTable = memo(function ResourceTable({
       document.removeEventListener('keydown', handleKeyDown)
     }
   }, [contextMenuRowId])
-
-  useEffect(() => {
-    if (!onLoadMore || !hasMore) return
-    const el = loadMoreRef.current
-    if (!el) return
-    const observer = new IntersectionObserver(
-      ([entry]) => {
-        if (entry.isIntersecting) onLoadMore()
-      },
-      { rootMargin: '200px' }
-    )
-    observer.observe(el)
-    return () => observer.disconnect()
-  }, [onLoadMore, hasMore])
 
   const hasCheckbox = selectable != null
   const bodyDrop = rowDragDrop?.body
@@ -380,14 +399,23 @@ const ResourceTable = memo(function ResourceTable({
       <div
         ref={scrollRef}
         className={cn(
-          'min-h-0 flex-1 overflow-auto overscroll-none',
+          '@container/resource-table min-h-0 flex-1 overflow-auto overscroll-none',
           showEmptyState && 'flex flex-col'
         )}
         onDragOver={bodyDrop?.onDragOver}
         onDragLeave={bodyDrop?.onDragLeave}
         onDrop={bodyDrop?.onDrop}
       >
-        <div role='table' className='grid w-full text-small'>
+        <div
+          role='table'
+          className='grid w-full min-w-[var(--resource-table-min-width)] text-small md:min-w-0 max-md:[--resource-table-name-width:calc(100cqw_-_var(--resource-table-selection-width))]'
+          style={
+            {
+              '--resource-table-min-width': `calc(100cqw + ${Math.max(0, columns.length - 1) * 136}px)`,
+              '--resource-table-selection-width': hasCheckbox ? CHECKBOX_COLUMN_WIDTH : '0px',
+            } as CSSProperties
+          }
+        >
           <div
             role='rowgroup'
             className='sticky top-0 z-10 grid border-[var(--border)] border-b bg-[var(--bg)]'
@@ -396,7 +424,7 @@ const ResourceTable = memo(function ResourceTable({
               {hasCheckbox && (
                 <div
                   role='columnheader'
-                  className='flex h-10 items-center py-1.5 pr-0 pl-5 text-left'
+                  className='flex h-10 items-center py-1.5 pr-0 pl-5 text-left max-md:h-11'
                 >
                   <Checkbox
                     size='sm'
@@ -404,6 +432,7 @@ const ResourceTable = memo(function ResourceTable({
                     onCheckedChange={handleSelectAll}
                     disabled={selectable.disabled}
                     aria-label='Select all'
+                    className='max-md:before:inset-[-15px]'
                   />
                 </div>
               )}
@@ -411,7 +440,7 @@ const ResourceTable = memo(function ResourceTable({
                 <div
                   key={col.id}
                   role='columnheader'
-                  className='flex h-10 min-w-0 items-center px-6 py-1.5 text-left font-normal text-[var(--text-muted)] text-small'
+                  className='flex h-10 min-w-0 items-center px-3 py-1.5 text-left font-normal text-[var(--text-muted)] text-small max-md:h-11 md:px-6'
                 >
                   <span className='min-w-0 truncate'>{col.header}</span>
                 </div>
@@ -613,7 +642,7 @@ const CellContent = memo(function CellContent({
 
 interface DataRowProps {
   row: ResourceRow
-  columns: ResourceColumn[]
+  columns: readonly ResourceColumn[]
   selectedRowId?: string | null
   selectable?: SelectableConfig
   rowDragDrop?: RowDragDropConfig
@@ -766,14 +795,19 @@ const DataRow = memo(function DataRow({
             onCheckedChange={handleSelectRow}
             disabled={selectable.disabled}
             aria-label='Select row'
+            className='max-md:before:inset-[-15px]'
             onClick={handleSelectRowClick}
           />
         </div>
       )}
-      {columns.map((col) => {
+      {columns.map((col, index) => {
         const cell = row.cells[col.id]
         return (
-          <div key={col.id} role='cell' className='flex min-w-0 items-center px-6 py-2.5'>
+          <div
+            key={col.id}
+            role='cell'
+            className='flex min-h-11 min-w-0 items-center gap-1 px-3 pointer-coarse:py-0 py-0 md:min-h-0 md:px-6 md:py-2.5'
+          >
             <CellContent
               icon={cell?.icon}
               label={cell?.label || EMPTY_CELL_PLACEHOLDER}
@@ -782,6 +816,20 @@ const DataRow = memo(function DataRow({
               pinned={cell?.pinned}
               highlight={cell?.highlight}
             />
+            {index === 0 && onRowContextMenu && (
+              <div className='ml-auto pointer-coarse:flex hidden shrink-0 max-md:flex'>
+                <Chip
+                  leftIcon={MoreHorizontal}
+                  mobileIconOnly
+                  aria-label={cell?.label ? `Actions for ${cell.label}` : 'Row actions'}
+                  className='size-11 justify-center'
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    onRowContextMenu(event, row.id)
+                  }}
+                />
+              </div>
+            )}
           </div>
         )
       })}

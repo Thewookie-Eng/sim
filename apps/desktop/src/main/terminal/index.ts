@@ -37,8 +37,13 @@ import {
   isResourceTabSelectionShortcut,
   resourceTabTargetIndex,
 } from '@/main/resource-shortcuts'
-import { readForegroundProcessGroup, signalProcessGroup } from '@/main/terminal/process-group'
-import { elide, TerminalSession } from '@/main/terminal/session'
+import {
+  type ForegroundProcessGroup,
+  readForegroundProcessGroup,
+  signalProcessGroup,
+} from '@/main/terminal/process-group'
+import type { RunLedger } from '@/main/terminal/run-ledger'
+import { elide, type ShellStartupBounds, TerminalSession } from '@/main/terminal/session'
 import {
   activePane,
   awaitRun,
@@ -49,6 +54,7 @@ import {
   killPane,
   listPanes,
   pollRun,
+  type RecordedRun,
   resolveAttachment,
   runPaneState,
   sendKey,
@@ -63,11 +69,15 @@ import {
 const logger = createLogger('DesktopTerminal')
 
 /**
- * How long to let a just-spawned shell finish its startup files before
- * concluding it has no integration. Generous because a heavy `.zshrc`
- * (nvm, pyenv, starship) can take a while on a cold start.
+ * How long a just-spawned shell gets to reach its first prompt. It begins our startup files
+ * before anything of the user's runs, so one that has not within seconds was never instrumented.
+ * The user's own files get far longer, since a heavy `.zshrc` (oh-my-zsh, nvm, pyenv) is slow on
+ * a cold start and slower on a busy machine; past that, it is waiting on something.
  */
-const SHELL_INTEGRATION_TIMEOUT_MS = 8_000
+const SHELL_STARTUP_BOUNDS: ShellStartupBounds = { unstartedMs: 8_000, startingMs: 30_000 }
+
+/** Enough of a stalled startup's screen to show what it is waiting on. */
+const STARTUP_SCREEN_LINES = 20
 
 /** Grace for a program to react to input before its screen is worth reading. */
 const INPUT_ECHO_MS = 250
@@ -156,16 +166,34 @@ export interface TerminalServiceOptions {
   canSpawn?(): boolean
   /** Reads and signals a terminal's foreground process group; the OS's by default. */
   processGroups?: TerminalProcessGroups
+  /** Where tagged tmux runs are recorded, so a later process can still stop them. */
+  runLedger?: RunLedger
 }
 
 interface TerminalProcessGroups {
-  foreground(shellPid: number): Promise<number | null>
+  foreground(shellPid: number): Promise<ForegroundProcessGroup>
   signal(pgid: number, signal: NodeJS.Signals): void
 }
 
 const OS_PROCESS_GROUPS: TerminalProcessGroups = {
   foreground: readForegroundProcessGroup,
   signal: signalProcessGroup,
+}
+
+/** The terminal work a restart would cut off. */
+export interface TerminalWork {
+  /** The command line holding each busy terminal's foreground, `''` when unannounced. */
+  commands: string[]
+  /** Terminals whose foreground could not be read, which may be running anything. */
+  uncheckedCount: number
+}
+
+async function foregroundGroupId(
+  groups: TerminalProcessGroups,
+  shellPid: number
+): Promise<number | null> {
+  const foreground = await groups.foreground(shellPid)
+  return foreground.kind === 'group' ? foreground.pgid : null
 }
 
 /**
@@ -293,6 +321,32 @@ export class TerminalService {
     if (!this.cwdTimer) return
     clearInterval(this.cwdTimer)
     this.cwdTimer = null
+  }
+
+  /**
+   * What each terminal is running. A shell without integration (fish, sh) announces nothing, so
+   * the OS's foreground process group answers for it; one the OS could not be asked about is
+   * reported as unchecked rather than idle.
+   */
+  async runningWork(): Promise<TerminalWork> {
+    const groups = this.options.processGroups ?? OS_PROCESS_GROUPS
+    const perSession = await Promise.all(
+      [...this.sessions.values()].map(
+        async (session): Promise<{ command: string | null; unchecked: boolean }> => {
+          if (session.isBusy) return { command: session.foreground ?? '', unchecked: false }
+          if (session.hasShellIntegration) return { command: null, unchecked: false }
+          const foreground = await groups.foreground(session.pid)
+          return {
+            command: foreground.kind === 'group' ? '' : null,
+            unchecked: foreground.kind === 'unknown',
+          }
+        }
+      )
+    )
+    return {
+      commands: perSession.flatMap(({ command }) => (command === null ? [] : [command])),
+      uncheckedCount: perSession.filter(({ unchecked }) => unchecked).length,
+    }
   }
 
   getTabs(): TerminalTabsState {
@@ -490,15 +544,27 @@ export class TerminalService {
   private async reapFinishedRuns(terminalId: string, env: NodeJS.ProcessEnv): Promise<void> {
     // A closed tab's run whose pane has since gone (its command ended) needs no stopping.
     for (const [handle, orphanEnv] of this.orphanedRuns) {
-      if ((await runPaneState(handle, orphanEnv)) === 'gone') this.orphanedRuns.delete(handle)
+      if ((await runPaneState(handle, orphanEnv)) === 'gone') {
+        this.orphanedRuns.delete(handle)
+        this.forgetRun(handle)
+      }
     }
     for (const handle of this.pendingRuns.get(terminalId) ?? []) {
       if (this.awaitedRuns.has(handle)) continue
-      if (isRunComplete(handle) || (await runPaneState(handle, env)) === 'gone') {
+      const complete = isRunComplete(handle)
+      if (complete || (await runPaneState(handle, env)) === 'gone') {
+        // A pane kept open after its command ended (`remain-on-exit`) closes with its run.
+        if (complete) await closeRunPane(handle, env)
         this.untrackRun(terminalId, handle)
+        this.forgetRun(handle)
         handle.dispose()
       }
     }
+  }
+
+  /** Drops a run's record once nothing of it is left for any process to stop. */
+  private forgetRun(handle: TmuxRunHandle): void {
+    if (handle.runId) this.options.runLedger?.forget(handle.runId)
   }
 
   /** Removes a run's files now, or once the call still reading them is done with them. */
@@ -521,7 +587,19 @@ export class TerminalService {
     const pending = this.pendingRuns.get(terminalId)
     if (!pending) return
     for (const handle of pending) {
-      if (env && !isRunComplete(handle)) this.orphanedRuns.set(handle, env)
+      // A finished run's pane may still be open (`remain-on-exit`): it is closed, while still the
+      // run's, before the record goes, and its files go only after that check, which an untracked
+      // run needs them for. Without the shell's environment the record stays, and the next sweep
+      // closes it. An untracked run is never stopped, so it is not kept either.
+      if (isRunComplete(handle) && env) {
+        void closeRunPane(handle, env)
+          .then(async () => {
+            if ((await runPaneState(handle, env)) === 'gone') this.forgetRun(handle)
+          })
+          .finally(() => this.releaseRun(handle))
+        continue
+      }
+      if (env && handle.runId !== null && !isRunComplete(handle)) this.orphanedRuns.set(handle, env)
       this.releaseRun(handle)
     }
     this.pendingRuns.delete(terminalId)
@@ -910,6 +988,13 @@ export class TerminalService {
     await Promise.allSettled(stops)
   }
 
+  /** Stops the command a plain shell's `run` handed back as still going, if it still is. */
+  async stopAgentCommand(toolCallId: string): Promise<void> {
+    await Promise.allSettled(
+      [...this.sessions.values()].map((session) => this.stopCommand(session, toolCallId))
+    )
+  }
+
   /** Waits for the command a run started to end, up to `ms`. */
   private async commandEnds(
     session: TerminalSession,
@@ -934,12 +1019,12 @@ export class TerminalService {
   private async stopCommand(session: TerminalSession, toolCallId: string): Promise<void> {
     if (session.agentCommandToolCallId !== toolCallId) return
     const groups = this.options.processGroups ?? OS_PROCESS_GROUPS
-    const pgid = await groups.foreground(session.pid)
+    const pgid = await foregroundGroupId(groups, session.pid)
     if (session.agentCommandToolCallId !== toolCallId) return
     session.kill('SIGINT')
     for (const escalation of ['SIGTERM', 'SIGKILL'] as const) {
       if (await this.commandEnds(session, toolCallId, STOP_ESCALATION_MS)) return
-      if (pgid === null || (await groups.foreground(session.pid)) !== pgid) return
+      if (pgid === null || (await foregroundGroupId(groups, session.pid)) !== pgid) return
       if (session.agentCommandToolCallId !== toolCallId) return
       logger.info('Stopped command ignored the previous signal; escalating', {
         toolCallId,
@@ -1031,7 +1116,7 @@ export class TerminalService {
       }
       case 'run':
         return tmux
-          ? this.runInTmux(session, tmux.session, args, latch)
+          ? this.runInTmux(toolCallId, session, tmux.session, args, latch)
           : this.run(toolCallId, session, args, latch)
       case 'read': {
         const requested = Number(args.lines)
@@ -1265,6 +1350,7 @@ export class TerminalService {
    * see through tmux.
    */
   private async runInTmux(
+    toolCallId: string,
     terminal: TerminalSession,
     session: string,
     args: TerminalToolArgs,
@@ -1276,7 +1362,15 @@ export class TerminalService {
 
     const started = Date.now()
     await this.reapFinishedRuns(terminal.terminalId, terminal.env)
-    const handle = await startRun(session, command, terminal.currentCwd, terminal.env)
+    const ledger = this.options.runLedger
+    const handle = await startRun(session, command, terminal.currentCwd, terminal.env, {
+      ...(ledger
+        ? {
+            beforeStart: (run: RecordedRun) =>
+              ledger.record({ ...run, callId: toolCallId, state: 'started' }),
+          }
+        : {}),
+    })
     if ('error' in handle) throw new TerminalError('SPAWN_FAILED', handle.error)
     // Tracked from the moment its window exists, so sign-out can stop it even mid-wait.
     const pending = this.pendingRuns.get(terminal.terminalId)
@@ -1300,7 +1394,11 @@ export class TerminalService {
     if (latch.signal.aborted) void latch.stopRunning()
     const outcome = await Promise.race([
       awaitRun(handle, waitMs),
-      stopped.then(() => ({ ...pollRun(handle), done: true })),
+      // A stopped run's closed pane never writes its status. An untracked run is never stopped,
+      // so it is still going unless its status says otherwise.
+      stopped.then(() =>
+        handle.runId === null ? pollRun(handle) : { ...pollRun(handle), done: true }
+      ),
     ]).finally(() => {
       this.awaitedRuns.delete(handle)
       if (this.releasedAwaitedRuns.delete(handle)) handle.dispose()
@@ -1308,10 +1406,12 @@ export class TerminalService {
     if (outcome.done) {
       await closeRunPane(handle, terminal.env)
       this.untrackRun(terminal.terminalId, handle)
+      this.forgetRun(handle)
       handle.dispose()
     }
     // Still going, it stays tracked, and nothing polls the status file again: `read` captures
-    // the pane instead.
+    // the pane instead. Its record is marked handed back only once that result reaches the model;
+    // see `TerminalRegistry.markRunDelivered`.
 
     const { text, truncated } = elideOutput(outcome.output)
     return {
@@ -1338,13 +1438,7 @@ export class TerminalService {
       throw new TerminalError('INVALID_REQUEST', 'run needs a `command`.')
     }
     if (!session.hasShellIntegration) {
-      await session.waitForShellIntegration(SHELL_INTEGRATION_TIMEOUT_MS)
-    }
-    if (!session.hasShellIntegration) {
-      throw new TerminalError(
-        'NO_SHELL_INTEGRATION',
-        'This shell did not load Sim shell integration, so command boundaries and exit codes cannot be determined. Ask the user to run the command themselves, or use a bash/zsh session.'
-      )
+      await this.awaitShellStartup(session, latch)
     }
     if (session.isBusy) {
       throw new TerminalError(
@@ -1356,6 +1450,31 @@ export class TerminalService {
     if (latch.signal.aborted) throw stoppedBeforeStart()
     latch.stopRunning = () => this.stopCommand(session, toolCallId)
     return session.runCommand(command, toolCallId, resolveRunWaitMs(args.waitSeconds))
+  }
+
+  /** Waits for a shell's first prompt, refusing the run with what it is doing if none comes. */
+  private async awaitShellStartup(session: TerminalSession, latch: StopLatch): Promise<void> {
+    const readiness = await session.waitForShellIntegration(SHELL_STARTUP_BOUNDS, latch.signal)
+    switch (readiness) {
+      case 'ready':
+        return
+      case 'stopped':
+        throw stoppedBeforeStart()
+      case 'exited':
+        throw new TerminalError('SESSION_CLOSED', 'The shell exited before it reached a prompt.')
+      case 'starting': {
+        const screen = (await session.readScrollback(STARTUP_SCREEN_LINES)).output.trim()
+        throw new TerminalError(
+          'NO_SHELL_INTEGRATION',
+          `The shell began its startup files over ${SHELL_STARTUP_BOUNDS.startingMs / 1000} s ago but never reached a prompt Sim can track, so nothing was run. Its screen:\n${screen || '(empty)'}\nIf a startup file is waiting for an answer, ask the user to answer it in that terminal (terminalId ${session.terminalId}), then run the command again. If the screen shows a prompt, a startup file replaced the shell (such as exec tmux or exec fish), so ask the user to run the command themselves.`
+        )
+      }
+      case 'not-instrumented':
+        throw new TerminalError(
+          'NO_SHELL_INTEGRATION',
+          'This shell did not load Sim shell integration, so command boundaries and exit codes cannot be determined. Ask the user to run the command themselves, or use a bash/zsh session.'
+        )
+    }
   }
 
   private spawn(

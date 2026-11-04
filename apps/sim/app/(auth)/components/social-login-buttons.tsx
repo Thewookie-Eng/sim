@@ -1,13 +1,19 @@
 'use client'
 
-import { type ReactNode, useState } from 'react'
-import { Chip, cn } from '@sim/emcn'
+import { useState } from 'react'
+import {
+  AuthFormMessage,
+  AuthGithubIcon,
+  AuthGoogleIcon,
+  AuthMicrosoftIcon,
+  AuthProviderGroup,
+  AuthButton as Chip,
+} from '@sim/auth-ui'
 import { createLogger } from '@sim/logger'
 import { getErrorMessage } from '@sim/utils/errors'
-import { GithubIcon, GoogleIcon, MicrosoftIcon } from '@/components/icons'
-import { client } from '@/lib/auth/auth-client'
+import { type SocialSignInProvider, startSocialSignIn } from '@/lib/auth/social-sign-in'
 import { DEFAULT_POST_AUTH_ROUTE } from '@/app/(auth)/auth-redirect'
-import { AUTH_BUTTON_CLASS } from '@/app/(auth)/components/constants'
+import { SSOLoginButton } from '@/app/(auth)/components/sso-login-button'
 
 const logger = createLogger('SocialLoginButtons')
 
@@ -15,108 +21,90 @@ interface SocialLoginButtonsProps {
   githubAvailable: boolean
   googleAvailable: boolean
   microsoftAvailable: boolean
+  view: 'login' | 'signup'
   callbackURL?: string
-  children?: ReactNode
+  ssoEnabled?: boolean
+  disabled?: boolean
 }
+
+/** Display order of the provider buttons. */
+const PROVIDERS = [
+  { provider: 'google', label: 'Google', icon: AuthGoogleIcon },
+  { provider: 'microsoft', label: 'Microsoft', icon: AuthMicrosoftIcon },
+  { provider: 'github', label: 'GitHub', icon: AuthGithubIcon },
+] as const
 
 export function SocialLoginButtons({
   githubAvailable,
   googleAvailable,
   microsoftAvailable,
+  view,
   callbackURL = DEFAULT_POST_AUTH_ROUTE,
-  children,
+  ssoEnabled,
+  disabled,
 }: SocialLoginButtonsProps) {
-  const [isGithubLoading, setIsGithubLoading] = useState(false)
-  const [isGoogleLoading, setIsGoogleLoading] = useState(false)
-  const [isMicrosoftLoading, setIsMicrosoftLoading] = useState(false)
+  const [loadingProvider, setLoadingProvider] = useState<SocialSignInProvider | null>(null)
 
-  async function signInWithGithub() {
-    if (!githubAvailable) return
+  const [error, setError] = useState<string | null>(null)
 
-    setIsGithubLoading(true)
+  const available: Record<SocialSignInProvider, boolean> = {
+    github: githubAvailable,
+    google: googleAvailable,
+    microsoft: microsoftAvailable,
+  }
+
+  async function signIn(provider: SocialSignInProvider, label: string) {
+    if (loadingProvider || disabled) return
+    setError(null)
+    setLoadingProvider(provider)
     try {
-      await client.signIn.social({ provider: 'github', callbackURL })
+      const result = await startSocialSignIn({
+        provider,
+        view,
+        surface: 'auth_page',
+        callbackURL,
+      })
+      if (result.error) {
+        throw new Error(
+          result.error.message || `Could not start ${label} sign-in. Please try again.`
+        )
+      }
     } catch (err) {
-      logger.error('GitHub sign-in failed', { error: getErrorMessage(err) })
+      logger.error(`${label} sign-in failed`, { error: getErrorMessage(err) })
+      setError(getErrorMessage(err, `Could not start ${label} sign-in. Please try again.`))
     } finally {
-      setIsGithubLoading(false)
+      setLoadingProvider(null)
     }
   }
 
-  async function signInWithGoogle() {
-    if (!googleAvailable) return
-
-    setIsGoogleLoading(true)
-    try {
-      await client.signIn.social({ provider: 'google', callbackURL })
-    } catch (err) {
-      logger.error('Google sign-in failed', { error: getErrorMessage(err) })
-    } finally {
-      setIsGoogleLoading(false)
-    }
-  }
-
-  async function signInWithMicrosoft() {
-    if (!microsoftAvailable) return
-
-    setIsMicrosoftLoading(true)
-    try {
-      await client.signIn.social({ provider: 'microsoft', callbackURL })
-    } catch (err) {
-      logger.error('Microsoft sign-in failed', { error: getErrorMessage(err) })
-    } finally {
-      setIsMicrosoftLoading(false)
-    }
-  }
-
-  const githubButton = (
-    <Chip
-      fullWidth
-      leftIcon={GithubIcon}
-      className={cn(AUTH_BUTTON_CLASS, 'border border-[var(--border-1)]')}
-      disabled={!githubAvailable || isGithubLoading}
-      onClick={signInWithGithub}
-    >
-      {isGithubLoading ? 'Connecting…' : 'GitHub'}
-    </Chip>
-  )
-
-  const googleButton = (
-    <Chip
-      fullWidth
-      leftIcon={GoogleIcon}
-      className={cn(AUTH_BUTTON_CLASS, 'border border-[var(--border-1)]')}
-      disabled={!googleAvailable || isGoogleLoading}
-      onClick={signInWithGoogle}
-    >
-      {isGoogleLoading ? 'Connecting…' : 'Google'}
-    </Chip>
-  )
-
-  const microsoftButton = (
-    <Chip
-      fullWidth
-      leftIcon={MicrosoftIcon}
-      className={cn(AUTH_BUTTON_CLASS, 'border border-[var(--border-1)]')}
-      disabled={!microsoftAvailable || isMicrosoftLoading}
-      onClick={signInWithMicrosoft}
-    >
-      {isMicrosoftLoading ? 'Connecting…' : 'Microsoft'}
-    </Chip>
-  )
-
-  const hasAnyOAuthProvider = githubAvailable || googleAvailable || microsoftAvailable
-
-  if (!hasAnyOAuthProvider && !children) {
+  if (!githubAvailable && !googleAvailable && !microsoftAvailable && !ssoEnabled) {
     return null
   }
 
   return (
-    <div className='grid gap-3'>
-      {googleAvailable && googleButton}
-      {microsoftAvailable && microsoftButton}
-      {githubAvailable && githubButton}
-      {children}
+    <div className='au:space-y-2'>
+      <AuthProviderGroup>
+        {PROVIDERS.filter(({ provider }) => available[provider]).map(
+          ({ provider, label, icon }) => (
+            <Chip
+              key={provider}
+              fullWidth
+              leftIcon={icon}
+              disabled={disabled || loadingProvider !== null}
+              onClick={() => signIn(provider, label)}
+            >
+              {loadingProvider === provider ? 'Connecting…' : label}
+            </Chip>
+          )
+        )}
+        {ssoEnabled && (
+          <SSOLoginButton
+            callbackURL={callbackURL}
+            disabled={disabled || loadingProvider !== null}
+          />
+        )}
+      </AuthProviderGroup>
+      {error && <AuthFormMessage type='error'>{error}</AuthFormMessage>}
     </div>
   )
 }

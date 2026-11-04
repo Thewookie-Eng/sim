@@ -11,15 +11,20 @@ import type { Sql } from 'postgres'
  *   resolves; a crash mid-run means the whole migration re-runs from the top
  *   on the next upgrade. Guard with cheap preconditions (`WHERE x IS NULL`,
  *   `ON CONFLICT DO NOTHING`) so re-runs are near-free.
- * - **db-level imports only** (`postgres`, `drizzle-orm`, `@sim/utils`). The
- *   migrations docker image ships `packages/db` + `utils` + `logger` and
- *   nothing from `apps/*`.
+ * - **db-level imports only** (`postgres`, `drizzle-orm`, `@sim/utils`,
+ *   `@sim/security`). The migrations docker image ships `packages/db` + `utils`
+ *   + `logger` + `security` and nothing from `apps/*`.
  * - **Runs at whatever schema HEAD the release ships** — scripts are not
  *   interleaved with SQL migrations. A SQL migration must never drop or
  *   repurpose a column that a registered script still reads; delete the
  *   script from the registry in the same PR instead.
  * - **Owns its transactions.** The runner deliberately does not wrap `up` in
  *   one: backfills commit per batch and cannot be rolled back wholesale.
+ * - **May defer.** A migration that needs a configuration the deployment may
+ *   not have yet throws {@link ScriptMigrationDeferred}: nothing is recorded,
+ *   later migrations still run, and the runner tries it again on every run
+ *   until it applies. No later migration may depend on the work of one that
+ *   can defer.
  */
 export interface ScriptMigration {
   /** Unique stable identifier recorded in `script_migrations`; never rename after release. */
@@ -36,11 +41,10 @@ export interface ScriptMigration {
   up(sql: Sql): Promise<void>
 }
 
-/**
- * Thrown by `up` to leave the migration unrecorded without failing the upgrade,
- * so the next upgrade runs it again: for work this database refuses today but
- * may accept later, such as an extension the migration role may not yet create.
- */
+/** Thrown by `up` to leave a migration unrecorded, without failing the run, until a later run. */
 export class ScriptMigrationDeferred extends Error {
-  override name = 'ScriptMigrationDeferred'
+  constructor(reason: string) {
+    super(reason)
+    this.name = 'ScriptMigrationDeferred'
+  }
 }

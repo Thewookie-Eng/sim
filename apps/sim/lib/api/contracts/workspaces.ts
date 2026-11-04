@@ -13,6 +13,7 @@ export type WorkspacePermission = z.output<typeof workspacePermissionSchema>
 export const workspaceSchema = z.object({
   id: z.string(),
   name: z.string(),
+  color: z.string().optional(),
   logoUrl: z.string().nullable().optional(),
   ownerId: z.string(),
   organizationId: z.string().nullable(),
@@ -28,6 +29,17 @@ export const workspaceSchema = z.object({
   isOrgAdmin: z.boolean().optional(),
   billedAccountUserId: z.string().nullable().optional(),
   allowPersonalApiKeys: z.boolean().optional(),
+  storageUsedBytes: z.number().nonnegative().optional(),
+  inboxEnabled: z.boolean().optional(),
+  inboxAddress: z.string().nullable().optional(),
+  inboxProviderId: z.string().nullable().optional(),
+  inboxSecretScope: z.string().optional(),
+  inboxMountedSecrets: z.array(z.string()).optional(),
+  archivedAt: z.string().datetime().nullable().optional(),
+  organizationAssignedAt: z.string().datetime().nullable().optional(),
+  forkSyncNewWorkflowsExcluded: z.boolean().optional(),
+  createdAt: z.string().datetime().optional(),
+  updatedAt: z.string().datetime().optional(),
   inviteMembersEnabled: z.boolean().optional(),
   inviteDisabledReason: z.string().nullable().optional(),
   inviteUpgradeRequired: z.boolean().optional(),
@@ -276,6 +288,11 @@ export const workspaceHostContextSchema = z.object({
       knowledgeMemberAccess: z.boolean().optional(),
       /** Optional for rolling compatibility with app versions that predate administrator mode. */
       knowledgeSourceMirroredAccess: z.boolean().optional(),
+      /**
+       * Whether the workspace payer may use Chat. Optional for rolling compatibility; absent
+       * leaves the composer open, and run admission still decides.
+       */
+      chat: z.boolean().optional(),
     })
     .optional(),
   /** Optional for rolling compatibility with app versions that predate deployment projection. */
@@ -329,6 +346,10 @@ export const getWorkspaceUsageGateContract = defineRouteContract({
   },
 })
 
+const updateWorkspaceResponseSchema = z.object({
+  workspace: workspaceSchema,
+})
+
 export const updateWorkspaceContract = defineRouteContract({
   method: 'PATCH',
   path: '/api/workspaces/[id]',
@@ -336,9 +357,19 @@ export const updateWorkspaceContract = defineRouteContract({
   body: updateWorkspaceBodySchema,
   response: {
     mode: 'json',
-    schema: z.object({
-      workspace: workspaceSchema,
-    }),
+    schema: updateWorkspaceResponseSchema,
+  },
+})
+
+/** `PUT` is a legacy alias of {@link updateWorkspaceContract} with the same partial-update semantics. */
+export const updateWorkspacePutContract = defineRouteContract({
+  method: 'PUT',
+  path: '/api/workspaces/[id]',
+  params: workspaceParamsSchema,
+  body: updateWorkspaceBodySchema,
+  response: {
+    mode: 'json',
+    schema: updateWorkspaceResponseSchema,
   },
 })
 

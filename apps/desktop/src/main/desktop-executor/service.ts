@@ -31,11 +31,15 @@ import {
   type DesktopApprovalItem,
   DesktopExecutor,
   type DesktopToolRunner,
+  isDeliveredResult,
 } from '@/main/desktop-executor/executor'
 import { createExecutorJournal } from '@/main/desktop-executor/journal'
 import {
+  type ClaimedDesktopCall,
   DESKTOP_EXECUTOR_PROTOCOL_VERSION,
   type DesktopExecutorTiming,
+  type DesktopImportEntryRequest,
+  type DesktopImportedEntry,
 } from '@/main/desktop-executor/protocol'
 
 const logger = createLogger('DesktopExecutorService')
@@ -57,6 +61,12 @@ export interface DesktopExecutorServiceDeps {
   accountDataAvailable: () => boolean
   runner: DesktopToolRunner
   onApprovals?: (items: DesktopApprovalItem[]) => void
+  /** Whether any chat has desktop work claimed on this machine changed. */
+  onBusyChange?: (busy: boolean) => void
+  /** Sim has taken a call's real result as the call's own, so the model has it. */
+  onResultDelivered?: (toolCallId: string) => void
+  /** Sim is done with a call whose real result the model never got. */
+  onResultNotDelivered?: (toolCallId: string) => void
 }
 
 export interface DesktopExecutorService {
@@ -64,6 +74,19 @@ export interface DesktopExecutorService {
   /** Re-registers after a sign-in, a session change, or a change to what this device can run. */
   refreshRegistration(): void
   getDevice(): DesktopExecutorDevice | null
+  /**
+   * The calls whose real result ({@link isDeliveredResult}) is in the journal and not yet
+   * acknowledged, so recovery will hand it to the model. Read once, before recovery can change the
+   * journal, whenever it is asked; empty when the journal cannot be read.
+   */
+  pendingResults(): Promise<Set<string>>
+  /** Confirms that Sim still authorizes this device to execute the claimed call. */
+  revalidateCall(call: ClaimedDesktopCall): Promise<boolean>
+  /** Stores one entry of a claimed import, as this device's registered session. */
+  importEntry(
+    request: DesktopImportEntryRequest,
+    signal: AbortSignal
+  ): Promise<DesktopImportedEntry>
   /** Sign-out: stops every action, forgets every call, and retires this install id. */
   signOut(): Promise<void>
 }
@@ -120,6 +143,32 @@ export function createDesktopExecutorService(
   let registrationFailedOffline = false
   let suspended = false
   let started = false
+  /** The journal's pending real results as they stood before this process's recovery. */
+  let pendingSnapshot: Promise<Set<string>> | null = null
+  const pendingResultsSnapshot = (): Promise<Set<string>> => {
+    // An unreadable journal loads as empty, so it holds none.
+    pendingSnapshot ??= journal
+      .load()
+      .then(
+        (entries) =>
+          new Set(
+            entries.flatMap((entry) =>
+              entry.state === 'result' && isDeliveredResult(entry.completion)
+                ? [entry.toolCallId]
+                : []
+            )
+          )
+      )
+      // The journal reads an unreadable file as empty, so this is for a load that throws anyway:
+      // it holds none, and the executor still starts.
+      .catch((error: unknown) => {
+        logger.warn('Could not read the executor journal for pending results', {
+          error: getErrorMessage(error),
+        })
+        return new Set<string>()
+      })
+    return pendingSnapshot
+  }
   /** Bumped on sign-out, so work started for the previous session cannot resume it. */
   let generation = 0
   let executorDeviceId: string | null = null
@@ -229,7 +278,12 @@ export function createDesktopExecutorService(
         leaseRenewMs: nextTiming.leaseRenewMs,
         onUnregistered: handleUnrecognized,
         ...(deps.onApprovals ? { onApprovals: deps.onApprovals } : {}),
+        ...(deps.onBusyChange ? { onBusyChange: deps.onBusyChange } : {}),
+        ...(deps.onResultDelivered ? { onResultDelivered: deps.onResultDelivered } : {}),
+        ...(deps.onResultNotDelivered ? { onResultNotDelivered: deps.onResultNotDelivered } : {}),
       })
+      // Recovery rewrites the journal, so what it held before is read first.
+      await pendingResultsSnapshot()
       await executor.recover()
       // Signed out while recovering: sign-out already disposed this executor.
       if (registrationGeneration !== generation || !executor) return
@@ -294,14 +348,14 @@ export function createDesktopExecutorService(
           ? { deviceId: id, protocolVersion: DESKTOP_EXECUTOR_PROTOCOL_VERSION }
           : null
       logger.info('Desktop executor registered', { enabled: nextTiming.enabled })
-      // Off for this user, and nothing here to finish: stay dormant. No inbox, no doorbell; only
+      // Off on this Sim, and nothing here to finish: stay dormant. No inbox, no doorbell; only
       // a slow recheck, so switching the executor on in Sim reaches this device without a relaunch.
       if (!device && !executor && (await journal.load()).length === 0) {
         if (registrationGeneration !== generation) return
         scheduleRegistration(DORMANT_RECHECK_MS)
         return
       }
-      // Off for this user mid-session, or results from a previous run to deliver: a turn already
+      // Off on this Sim mid-session, or results from a previous run to deliver: a turn already
       // bound here still finishes, so the executor serves the inbox; no new turn binds.
       await startExecutor(id, nextTiming, registrationGeneration)
     } catch (error) {
@@ -432,6 +486,19 @@ export function createDesktopExecutorService(
     },
     getDevice() {
       return device
+    },
+    pendingResults() {
+      return pendingResultsSnapshot()
+    },
+    async revalidateCall(call) {
+      const current = client
+      if (!current || !deps.accountDataAvailable()) return false
+      await current.renewLease(call.toolCallId, call.executionToken)
+      return client === current && deps.accountDataAvailable()
+    },
+    importEntry(request, signal) {
+      if (!client) throw new Error('The Sim desktop app is not signed in to Sim.')
+      return client.importEntry(request, signal)
     },
     async signOut() {
       // A registration in flight now answers for a session that is gone; it must not restart.

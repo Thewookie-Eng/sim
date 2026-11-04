@@ -7,11 +7,13 @@ import type { z } from 'zod'
 import { defineWorkspaceOperation } from '@/lib/core/application'
 import { defineOrganizationOperation } from '@/lib/core/application/organization-operation'
 import { OrchestrationError } from '@/lib/core/orchestration/types'
+import type { DbTransaction } from '@/lib/db/types'
 import { resolveTurnDesktopDevice } from '@/lib/desktop/application/executor'
 import { requireOrganizationSearchAvailable } from '@/lib/knowledge/access/availability'
 import { insertRunSegment, withRunAdmissionLock } from '@/lib/mothership/async-runs/repository'
 import { defineAuthorizedChatUseCase } from '@/lib/mothership/chat/application/authorized-chat-use-case'
 import { resolveOwnedChatContext } from '@/lib/mothership/chat/application/context'
+import { ChatSendSupersededError } from '@/lib/mothership/chat/application/send-superseded'
 import { withChatEffortChoice } from '@/lib/mothership/chat/intent'
 import { appendCopilotChatMessages } from '@/lib/mothership/chat/messages-store'
 import { authorizeOrganizationChat } from '@/lib/mothership/chat/organization-chats'
@@ -41,6 +43,64 @@ interface AdmitTurnInput {
   effortChoice?: MothershipEffort
   /** The composer's desktop, offered for its background executor to run this turn's desktop tools. */
   desktopDeviceId?: string
+}
+
+/**
+ * The desktop a turn runs on, if any. Only a workspace chat runs on a desktop in the background:
+ * its sidebar shows the status and an approval notification links back to it. An organization
+ * chat stays with its chat view.
+ */
+export async function turnDesktopDevice(
+  principal: SessionPrincipal,
+  workspaceId: string | null | undefined,
+  offeredDeviceId: string | undefined
+): Promise<string | null> {
+  if (!offeredDeviceId || !workspaceId) return null
+  return resolveTurnDesktopDevice(principal, offeredDeviceId)
+}
+
+interface TurnChat {
+  userId: string
+  workspaceId?: string | null
+  organizationId?: string | null
+  chatId: string
+}
+
+/**
+ * Makes an admitted turn its chat's current conversation, inside the admission's transaction:
+ * the chat's conversation mode follows the turn's, and a send's effort pick stays as the chat's
+ * choice. A chat deleted or moved since its context was resolved is `not_found`.
+ */
+export async function moveChatToTurn(
+  tx: DbTransaction,
+  chat: TurnChat,
+  turn: { messageId: string; mode?: string },
+  effortChoice?: MothershipEffort
+): Promise<{ model: string | null }> {
+  const turnConfig = sql`COALESCE(${copilotChats.config}, '{}'::jsonb) || jsonb_build_object('conversationMode', ${turn.mode ?? 'agent'}::text)`
+  const [updated] = await tx
+    .update(copilotChats)
+    .set({
+      conversationId: turn.messageId,
+      updatedAt: new Date(),
+      config: effortChoice ? withChatEffortChoice(turnConfig, effortChoice) : turnConfig,
+    })
+    .where(
+      and(
+        eq(copilotChats.id, chat.chatId),
+        eq(copilotChats.userId, chat.userId),
+        chat.workspaceId
+          ? eq(copilotChats.workspaceId, chat.workspaceId)
+          : isNull(copilotChats.workspaceId),
+        chat.organizationId
+          ? eq(copilotChats.organizationId, chat.organizationId)
+          : isNull(copilotChats.organizationId),
+        isNull(copilotChats.deletedAt)
+      )
+    )
+    .returning({ model: copilotChats.model })
+  if (!updated) throw new OrchestrationError('not_found', 'Chat not found')
+  return updated
 }
 
 /** The accepted message, its start intent and retry destination commit together. */
@@ -86,35 +146,9 @@ export const admitChatTurn = defineAuthorizedChatUseCase({
       else await requireOrganizationSearchAvailable(organizationId)
     }
     await assertChatStreamLease(input.lease)
-    const desktopDeviceId = input.desktopDeviceId
-      ? await resolveTurnDesktopDevice(principal, input.desktopDeviceId)
-      : null
-    const turnConfig = sql`COALESCE(${copilotChats.config}, '{}'::jsonb) || jsonb_build_object('conversationMode', ${request.mode ?? 'agent'}::text)`
+    const desktopDeviceId = await turnDesktopDevice(principal, workspaceId, input.desktopDeviceId)
     return withRunAdmissionLock(userId, request.messageId, async (tx) => {
-      const [chat] = await tx
-        .update(copilotChats)
-        .set({
-          conversationId: request.messageId,
-          updatedAt: new Date(),
-          config: input.effortChoice
-            ? withChatEffortChoice(turnConfig, input.effortChoice)
-            : turnConfig,
-        })
-        .where(
-          and(
-            eq(copilotChats.id, chatId),
-            eq(copilotChats.userId, userId),
-            workspaceId
-              ? eq(copilotChats.workspaceId, workspaceId)
-              : isNull(copilotChats.workspaceId),
-            organizationId
-              ? eq(copilotChats.organizationId, organizationId)
-              : isNull(copilotChats.organizationId),
-            isNull(copilotChats.deletedAt)
-          )
-        )
-        .returning({ model: copilotChats.model })
-      if (!chat) throw new OrchestrationError('not_found', 'Chat not found')
+      const chat = await moveChatToTurn(tx, context, request, input.effortChoice)
       await appendCopilotChatMessages(
         chatId,
         [buildPersistedUserMessage(input.message)],
@@ -155,8 +189,7 @@ export const admitChatTurn = defineAuthorizedChatUseCase({
           )
         )
         .returning({ key: idempotencyKey.key })
-      if (!claim)
-        throw new OrchestrationError('conflict', 'This send was superseded; retry the message')
+      if (!claim) throw new ChatSendSupersededError()
       return run
     })
   },

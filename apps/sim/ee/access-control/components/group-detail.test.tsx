@@ -4,7 +4,8 @@ import { act, type ReactNode } from 'react'
 import { createDeferred } from '@sim/testing/helpers/deferred'
 import { jsonResponse } from '@sim/testing/helpers/http'
 import { authClientMock } from '@sim/testing/mocks/auth-client.mock'
-import { nextNavigationMock } from '@sim/testing/mocks/next-navigation.mock'
+import { setEnvFlags } from '@sim/testing/mocks/env-flags.mock'
+import { nextNavigationMock, nextNavigationMockFns } from '@sim/testing/mocks/next-navigation.mock'
 import { providersModelsMock } from '@sim/testing/mocks/providers-models.mock'
 import { providersUtilsMock, providersUtilsMockFns } from '@sim/testing/mocks/providers-utils.mock'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -13,11 +14,14 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PermissionGroup } from '@/lib/api/contracts/permission-groups'
 import { DEFAULT_PERMISSION_GROUP_CONFIG } from '@/lib/permission-groups/fields'
+import { AccessControl } from '@/ee/access-control/components/access-control'
 import { GroupDetail } from '@/ee/access-control/components/group-detail'
+import { allowedProvidersKeys } from '@/hooks/queries/allowed-providers'
 import { organizationKeys } from '@/hooks/queries/utils/organization-keys'
 import { permissionGroupKeys } from '@/hooks/queries/utils/permission-group-keys'
+import { useSettingsDirtyStore } from '@/stores/settings/dirty/store'
 
-vi.mock('@/lib/auth/auth-client', () => authClientMock)
+vi.mock('@/lib/auth/client', () => authClientMock)
 vi.mock('next/navigation', () => nextNavigationMock)
 vi.mock('@/providers/models', () => providersModelsMock)
 vi.mock('@/providers/utils', () => providersUtilsMock)
@@ -68,13 +72,13 @@ afterEach(() => {
   vi.useRealTimers()
 })
 
-function render() {
+function render(currentGroup = group) {
   act(() =>
     root.render(
       <QueryClientProvider client={client}>
         <NuqsTestingAdapter hasMemory searchParams='?group-tab=providers'>
           <GroupDetail
-            group={group}
+            group={currentGroup}
             organizationId='org-1'
             workspaceOptions={[]}
             organizationWorkspaces={[]}
@@ -88,14 +92,26 @@ function render() {
   )
 }
 
+function providerControl(provider: string) {
+  return container.querySelector<HTMLButtonElement>(`button[aria-label^="${provider}: "]`)
+}
+
+function setProviderState(provider: string, state: 'Allowed' | 'Can request' | 'Unavailable') {
+  const trigger = providerControl(provider)
+  if (!trigger) throw new Error(`Missing ${provider} access control`)
+  act(() => trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+  const option = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(
+    (node) => node.textContent?.trim() === state
+  )
+  if (!option) throw new Error(`Missing ${state} option`)
+  act(() => option.click())
+}
+
 function expectNoProviderControls() {
-  expect(container.querySelector('[id^="provider-"]')).toBeNull()
+  for (const provider of ['openai', 'anthropic', 'google'])
+    expect(providerControl(provider)).toBeNull()
   expect(container.querySelector('input[placeholder="Search providers..."]')).toBeNull()
-  expect(
-    [...container.querySelectorAll('button')].some((button) =>
-      /^(De)?select All$/i.test(button.textContent ?? '')
-    )
-  ).toBe(false)
+  expect(container.querySelector('button[aria-label="Set shown permissions to"]')).toBeNull()
 }
 
 async function settle() {
@@ -104,7 +120,83 @@ async function settle() {
   })
 }
 
+describe('permission group settings availability', () => {
+  it.each([{}, { workspaceId: 'workspace-1' }])(
+    'edits groups without reading billing and retains the draft through a failed refresh (%j)',
+    async (params) => {
+      setEnvFlags({ isHosted: true, isBillingEnabled: true, isAccessControlEnabled: false })
+      nextNavigationMockFns.mockUseParams.mockReturnValue(params)
+      client.setQueryData(permissionGroupKeys.list('org-1'), [group])
+      client.setQueryData(permissionGroupKeys.orgWorkspaces('org-1'), [])
+      client.setQueryData(allowedProvidersKeys.blacklisted(), { blacklistedProviders: [] })
+      const requests: string[] = []
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string) => {
+          requests.push(url)
+          return jsonResponse({ error: 'Service temporarily unavailable' }, 503)
+        })
+      )
+      act(() =>
+        root.render(
+          <QueryClientProvider client={client}>
+            <NuqsTestingAdapter hasMemory searchParams='?group-id=group-1&group-tab=providers'>
+              <AccessControl organizationId='org-1' isOrganizationAdmin requestsHref='/requests' />
+            </NuqsTestingAdapter>
+          </QueryClientProvider>
+        )
+      )
+      await settle()
+      setProviderState('openai', 'Can request')
+      let left = false
+      act(() =>
+        useSettingsDirtyStore.getState().requestLeave(() => {
+          left = true
+        })
+      )
+      expect(left).toBe(false)
+      await act(async () => {
+        await client.invalidateQueries({ queryKey: permissionGroupKeys.list('org-1') })
+      })
+      await settle()
+      expect(providerControl('openai')?.getAttribute('aria-label')).toBe('openai: Can request')
+      left = false
+      act(() =>
+        useSettingsDirtyStore.getState().requestLeave(() => {
+          left = true
+        })
+      )
+      expect(left).toBe(false)
+      expect(requests.some((url) => url.startsWith('/api/billing'))).toBe(false)
+    }
+  )
+})
+
 describe('provider permission policy availability', () => {
+  it('stops warning after restoring the same provider membership in a different order', async () => {
+    providersUtilsMockFns.mockGetAllProviderIds.mockReturnValue(['openai', 'anthropic', 'google'])
+    client.setQueryData(allowedProvidersKeys.blacklisted(), { blacklistedProviders: [] })
+    render({
+      ...group,
+      config: { ...group.config, allowedModelProviders: ['openai', 'anthropic'] },
+    })
+    setProviderState('openai', 'Can request')
+    let left = false
+    act(() =>
+      useSettingsDirtyStore.getState().requestLeave(() => {
+        left = true
+      })
+    )
+    expect(left).toBe(false)
+    setProviderState('openai', 'Allowed')
+    act(() =>
+      useSettingsDirtyStore.getState().requestLeave(() => {
+        left = true
+      })
+    )
+    expect(left).toBe(true)
+  })
+
   it('withholds provider edits until the server policy is known', () => {
     vi.stubGlobal(
       'fetch',
@@ -149,13 +241,12 @@ describe('provider permission policy availability', () => {
       })
       await settle()
       expect(container.querySelector('[role="alert"]')).toBeNull()
-      const anthropic = container.querySelector<HTMLButtonElement>('#provider-anthropic')
-      expect(anthropic?.getAttribute('aria-checked')).toBe('true')
-      expect(Boolean(container.querySelector('#provider-openai'))).toBe(
-        !blacklist.includes('openai')
+      expect(providerControl('anthropic')?.getAttribute('aria-label')).toBe('anthropic: Allowed')
+      expect(Boolean(providerControl('openai'))).toBe(!blacklist.includes('openai'))
+      setProviderState('anthropic', 'Can request')
+      expect(providerControl('anthropic')?.getAttribute('aria-label')).toBe(
+        'anthropic: Can request'
       )
-      act(() => anthropic!.click())
-      expect(anthropic?.getAttribute('aria-checked')).toBe('false')
     }
   )
 })

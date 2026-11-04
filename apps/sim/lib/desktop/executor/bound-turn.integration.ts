@@ -5,10 +5,11 @@
  * through the real `requestRunStop`, and a waiter that dies is settled by the stale-execution cron.
  * Deadlines are moved on the row itself, which is all the server reads.
  */
+import { deleteWorkspaceFixture, insertWorkspaceFixture } from '@sim/db/testing/workspace-fixtures'
 import { authMock, authMockFns } from '@sim/testing/mocks/auth.mock'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { redisUrl, inheritedEnv, worker } = await vi.hoisted(async () => {
+const { redisUrl, inheritedEnv, worker, presence } = await vi.hoisted(async () => {
   const { readTestRedisUrl } = await import('@sim/db/testing/test-infrastructure')
   const { createServer } = await import('node:http')
   /** Stands in for the agent worker, which Stop also tells to end the stream. */
@@ -30,11 +31,15 @@ const { redisUrl, inheritedEnv, worker } = await vi.hoisted(async () => {
   if (url) process.env.REDIS_URL = url
   process.env.COPILOT_TOOL_PERMISSIONS_ENABLED = 'true'
   process.env.SIM_AGENT_API_URL = `http://127.0.0.1:${port}`
-  return { redisUrl: url, inheritedEnv, worker: { server } }
+  return { redisUrl: url, inheritedEnv, worker: { server }, presence: { available: true } }
 })
 
 vi.mock('@/lib/auth', () => authMock)
-vi.mock('@/lib/core/config/feature-flags', () => featureFlagsMock)
+/** Redis is always configured here; `presence.available` stands in for an install without it. */
+vi.mock('@/lib/desktop/executor/presence', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/desktop/executor/presence')>()),
+  isDesktopPresenceAvailable: () => presence.available,
+}))
 
 import type { SessionPrincipal } from '@sim/auth/principal'
 import { db } from '@sim/db'
@@ -49,7 +54,6 @@ import {
   user,
   workspace,
 } from '@sim/db/schema'
-import { featureFlagsMock, featureFlagsMockFns } from '@sim/testing/mocks/feature-flags.mock'
 import { sleep } from '@sim/utils/helpers'
 import { generateId } from '@sim/utils/id'
 import { eq, inArray, sql } from 'drizzle-orm'
@@ -337,7 +341,7 @@ describe.runIf(Boolean(redisUrl))("a turn bound to a desktop's background execut
       createdAt: now,
       updatedAt: now,
     })
-    await db.insert(workspace).values({
+    await insertWorkspaceFixture(db, {
       id: workspaceId,
       name: 'Bound turn fixture',
       ownerId: userId,
@@ -357,9 +361,7 @@ describe.runIf(Boolean(redisUrl))("a turn bound to a desktop's background execut
   })
 
   beforeEach(() => {
-    featureFlagsMockFns.mockIsFeatureEnabled.mockImplementation(
-      async (flag) => flag === 'mothership-desktop-background-executor'
-    )
+    presence.available = true
   })
 
   afterAll(async () => {
@@ -368,11 +370,11 @@ describe.runIf(Boolean(redisUrl))("a turn bound to a desktop's background execut
       await db.delete(auditLog).where(inArray(auditLog.resourceId, deviceIds))
       await db.delete(desktopDevices).where(inArray(desktopDevices.id, deviceIds))
     }
-    await db.delete(workspace).where(eq(workspace.id, workspaceId))
+    await deleteWorkspaceFixture(db, eq(workspace.id, workspaceId))
     await db.delete(user).where(eq(user.id, userId))
   })
 
-  it('binds a turn only to an executor registered to this very session, with the flag on', async () => {
+  it('binds a turn only to an executor registered to this very session, where Sim tracks presence', async () => {
     const desktop = await signedInDesktop()
     const viewer = await signedInDesktop({ executor: 0 })
     const otherSession: SessionPrincipal = { ...desktop.principal, sessionId: generateId() }
@@ -382,7 +384,7 @@ describe.runIf(Boolean(redisUrl))("a turn bound to a desktop's background execut
     )
     expect(await resolveTurnDesktopDevice(otherSession, desktop.deviceId)).toBeNull()
     expect(await resolveTurnDesktopDevice(viewer.principal, viewer.deviceId)).toBeNull()
-    featureFlagsMockFns.mockIsFeatureEnabled.mockResolvedValue(false)
+    presence.available = false
     expect(await resolveTurnDesktopDevice(desktop.principal, desktop.deviceId)).toBeNull()
   })
 
@@ -509,7 +511,7 @@ describe.runIf(Boolean(redisUrl))("a turn bound to a desktop's background execut
 
       await lapse(toolCallId, 'lease')
       /** A Sim tool waiting on the same run sweeps its expired executions; this one is not its. */
-      await revokeExpiredSimToolExecutions({ runId: run.runId, userId })
+      await revokeExpiredSimToolExecutions({ runId: run.runId, userId, toolCallId: 'waiting-call' })
       expect((await storedCall(toolCallId)).status).toBe('running')
       await answer
       const late = await desktop.complete(toolCallId, executionToken, { output: 'built' })
@@ -661,7 +663,7 @@ describe.runIf(Boolean(redisUrl))("a turn bound to a desktop's background execut
         userId,
         ownerToken: generateId(),
       }
-      expect(await claimToolExecution(owner)).toEqual({ outcome: 'claimed' })
+      expect(await claimToolExecution(owner)).toMatchObject({ outcome: 'claimed' })
       await expect(
         prepareWorkbenchAccess({ ...owner, sessionKey: chatSandboxSessionKey(run.chatId) })
       ).resolves.toMatchObject({ handlersPending: false })

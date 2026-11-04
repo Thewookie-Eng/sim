@@ -1,13 +1,50 @@
+import { resetEnvFlagsMock, setEnvFlags } from '@sim/testing'
 import { resetEnvMock, setEnv } from '@sim/testing/mocks/env.mock'
+import { unstable_doesMiddlewareMatch } from 'next/experimental/testing/server'
 import { NextRequest } from 'next/server'
-import { afterAll, describe, expect, it } from 'vitest'
-import { proxy, resolveApiCorsPolicy } from '@/proxy'
+import { afterAll, afterEach, describe, expect, it } from 'vitest'
+import { config, proxy, resolveApiCorsPolicy } from '@/proxy'
 
 setEnv({
   NEXT_PUBLIC_APP_URL: 'https://app.sim.test',
   SIM_MCP_URL: 'https://mcp.sim.test/mcp',
 })
 afterAll(resetEnvMock)
+
+describe('browser extension frame boundary', () => {
+  afterEach(() => setEnv({ BROWSER_EXTENSION_IDS: undefined }))
+
+  it('allows only configured extension ancestors on the dedicated surface', async () => {
+    setEnv({ BROWSER_EXTENSION_IDS: 'abcdefghijklmnopabcdefghijklmnop' })
+    const response = await proxy(new NextRequest('https://app.sim.test/extension/workspace-1'))
+    expect(response.headers.get('Content-Security-Policy')).toContain(
+      'frame-ancestors chrome-extension://abcdefghijklmnopabcdefghijklmnop;'
+    )
+    expect(response.headers.has('X-Frame-Options')).toBe(false)
+    expect(response.headers.get('Cache-Control')).toBe('private, no-store')
+    expect(response.headers.get('Referrer-Policy')).toBe('no-referrer')
+    expect(response.headers.get('X-Robots-Tag')).toBe('noindex, nofollow')
+
+    const ordinary = await proxy(new NextRequest('https://app.sim.test/login'))
+    expect(ordinary.headers.get('Content-Security-Policy')).toContain("frame-ancestors 'self'")
+    expect(ordinary.headers.get('X-Frame-Options')).toBe('SAMEORIGIN')
+  })
+
+  it.each([
+    undefined,
+    '',
+    '*',
+    'abcdefghijklmnopabcdefghijklmnop, https://evil.test',
+    'a'.repeat(2048),
+  ])(
+    'refuses embedding with absent or invalid deployment configuration: %s',
+    async (configured) => {
+      setEnv({ BROWSER_EXTENSION_IDS: configured })
+      const response = await proxy(new NextRequest('https://app.sim.test/extension'))
+      expect(response.headers.get('Content-Security-Policy')).toContain("frame-ancestors 'none'")
+    }
+  )
+})
 
 const EXPOSED_HEADERS =
   'Retry-After, WWW-Authenticate, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-Request-Id, X-Run-Id'
@@ -146,5 +183,100 @@ describe('proxy on the dedicated MCP host', () => {
 
   it('serves nothing else on the MCP host', () => {
     expect(proxy(mcpRequest('/login', 'GET')).status).toBe(404)
+  })
+
+  it.each(['', 'python-requests/2.32.3'])(
+    'allows ownership verification with an automated user agent: %s',
+    (userAgent) => {
+      const request = mcpRequest('/.well-known/openai-apps-challenge', 'GET')
+      if (userAgent) request.headers.set('user-agent', userAgent)
+      expect(proxy(request).status).toBe(200)
+      expect(proxy(mcpRequest('/.well-known/openai-apps-challenge/other', 'GET')).status).toBe(404)
+    }
+  )
+})
+
+describe('proxy indexing policy', () => {
+  afterEach(resetEnvFlagsMock)
+
+  const robotsTag = (pathname: string) =>
+    proxy(new NextRequest(`https://self-hosted.example${pathname}`)).headers.get('X-Robots-Tag')
+
+  it('keeps the marketing pages of a self-hosted deployment out of search results', () => {
+    setEnvFlags({ isHosted: false })
+    expect(robotsTag('/comparisons/n8n')).toBe('noindex, nofollow')
+    expect(robotsTag('/pricing')).toBe('noindex, nofollow')
+  })
+
+  it('keeps the marketing documents of a self-hosted deployment out of search results', () => {
+    setEnvFlags({ isHosted: false })
+    expect(robotsTag('/index.md')).toBe('noindex, nofollow')
+    expect(robotsTag('/llms.txt')).toBe('noindex, nofollow')
+    expect(robotsTag('/llms-full.txt')).toBe('noindex, nofollow')
+    expect(robotsTag('/changelog.xml')).toBe('noindex, nofollow')
+    expect(robotsTag('/library.md/some-article')).toBe('noindex, nofollow')
+  })
+
+  it('leaves the marketing pages and documents of the hosted deployment indexable', () => {
+    setEnvFlags({ isHosted: true })
+    expect(robotsTag('/comparisons/n8n')).toBeNull()
+    expect(robotsTag('/pricing')).toBeNull()
+    expect(robotsTag('/index.md')).toBeNull()
+    expect(robotsTag('/llms.txt')).toBeNull()
+    expect(robotsTag('/llms-full.txt')).toBeNull()
+    expect(robotsTag('/changelog.xml')).toBeNull()
+    expect(robotsTag('/library.md/some-article')).toBeNull()
+  })
+
+  it.each([
+    '/login',
+    '/signup',
+    '/verify',
+    '/oauth/consent',
+    '/invite/example',
+    '/desktop/auth',
+    '/cli/auth',
+    '/credential-groups/enroll/example',
+    '/f/example',
+    '/chat/example',
+  ])('keeps Auth out of search results on every deployment: %s', (pathname) => {
+    for (const isHosted of [false, true]) {
+      setEnvFlags({ isHosted })
+      expect(robotsTag(pathname)).toBe('noindex, nofollow')
+    }
+  })
+})
+
+describe('proxy matcher', () => {
+  const matches = (path: string) =>
+    unstable_doesMiddlewareMatch({ config, url: `https://sim.test${path}` })
+
+  it('leaves the desktop raw upload routes unbuffered, so a whole file reaches the route', () => {
+    expect(matches('/api/desktop/tool/import')).toBe(false)
+    expect(matches('/api/desktop/tool/file')).toBe(false)
+  })
+
+  it('leaves the document snapshot persists unbuffered, so a whole snapshot reaches the route', () => {
+    expect(matches('/api/internal/file-doc/persist')).toBe(false)
+    expect(matches('/api/internal/project-file-doc/project-1/file-1/persist')).toBe(false)
+  })
+
+  it('runs for the marketing documents, so the indexing policy reaches them', () => {
+    expect(matches('/index.md')).toBe(true)
+    expect(matches('/llms.txt')).toBe(true)
+    expect(matches('/llms-full.txt')).toBe(true)
+    expect(matches('/changelog.xml')).toBe(true)
+    expect(matches('/library.md/some-article')).toBe(true)
+  })
+
+  it('still runs for every other API route', () => {
+    expect(matches('/api/desktop/tool/claim')).toBe(true)
+    expect(matches('/api/desktop/tool/import/other')).toBe(true)
+    expect(matches('/api/workflows/wf-1/execute')).toBe(true)
+    expect(matches('/api/files/upload')).toBe(true)
+    expect(matches('/api/internal/project-file-doc/project-1/file-1/seed')).toBe(true)
+    expect(matches('/api/internal/project-file-doc/project-1/file-1/persist/other')).toBe(true)
+    expect(matches('/api/internal/file-doc/persist/other')).toBe(true)
+    expect(matches('/api/internal/file-doc/seed')).toBe(true)
   })
 })

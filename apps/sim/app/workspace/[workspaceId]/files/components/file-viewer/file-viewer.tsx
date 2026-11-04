@@ -1,12 +1,17 @@
 'use client'
 
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Music } from '@sim/emcn/icons'
 import dynamic from 'next/dynamic'
 import type { FileDownloadSource } from '@/lib/uploads/client/download'
-import type { WorkspaceFileRecord } from '@/lib/uploads/contexts/workspace'
-import { resolveMediaMimeType } from '@/lib/uploads/utils/file-utils'
 import {
+  MAX_TEXT_PREVIEW_BYTES,
+  TEXT_PREVIEW_SIZE_MESSAGE,
+} from '@/lib/uploads/client/text-content'
+import type { WorkspaceFileRecord } from '@/lib/uploads/contexts/workspace'
+import { resolveMediaMimeType } from '@/lib/uploads/utils/file'
+import {
+  useReresolveFileRecord,
   useWorkspaceFileBinary,
   useWorkspaceFileContent,
   useWorkspaceImageDimensionsAdapter,
@@ -15,6 +20,7 @@ import {
   createWorkspaceFileContentSource,
   type FileContentSource,
   FileContentSourceProvider,
+  useFileContentSource,
 } from '@/hooks/use-file-content-source'
 import { CsvTablePreview } from './csv-table-preview'
 import { DocxPreview } from './docx-preview'
@@ -51,12 +57,19 @@ const RichMarkdownEditor = dynamic(
  */
 const CSV_INLINE_EDIT_MAX_BYTES = 5 * 1024 * 1024
 
-export function isTextEditable(file: { type: string; name: string }): boolean {
-  return resolveFileCategory(file.type, file.name) === 'text-editable'
+export function isTextEditable(file: {
+  type: string
+  name: string
+  size?: number | null
+}): boolean {
+  return (
+    resolveFileCategory(file.type, file.name) === 'text-editable' &&
+    (file.size ?? 0) <= MAX_TEXT_PREVIEW_BYTES
+  )
 }
 
-export function isPreviewable(file: { type: string; name: string }): boolean {
-  return resolvePreviewType(file.type, file.name) !== null
+export function isPreviewable(file: { type: string; name: string; size?: number | null }): boolean {
+  return resolvePreviewType(file.type, file.name) !== null && isTextEditable(file)
 }
 
 /**
@@ -109,6 +122,12 @@ interface FileViewerProps {
     status: 'idle' | 'saving' | 'saved' | 'error',
     retry?: () => Promise<void>
   ) => void
+  /** Receives why a save was refused; text files only. */
+  onSaveError?: (error: unknown) => void
+  /** Replaces the file's own preview pane, for an owner with a richer view of the file. */
+  preview?: ReactNode
+  /** Which side of a split the source takes; `end` puts it after the preview. */
+  sourceSide?: 'start' | 'end'
   saveRef?: React.MutableRefObject<(() => Promise<void>) | null>
   downloadSourceRef?: React.MutableRefObject<FileDownloadSource | null>
   discardRef?: React.MutableRefObject<(() => void) | null>
@@ -125,10 +144,11 @@ interface FileViewerProps {
    */
   collaborative?: boolean
   /**
-   * Called (debounced) with the markdown document's leading-heading text while the file is still
-   * untitled, so the caller can name the file after it. Only wired for the editable markdown editor.
+   * Called with the file id and the markdown document's leading-heading text once the user finishes
+   * that heading while the file is still untitled, so the caller can name the file after it. Only wired
+   * for the editable markdown editor.
    */
-  onDeriveTitleFromHeading?: (headingText: string) => void
+  onDeriveTitleFromHeading?: (fileId: string, headingText: string) => void
   /**
    * Let an open markdown file claim Cmd/Ctrl+F for find-in-document. Set wherever the file is the
    * whole pane the user is reading — the Files page, the mothership file view, the public share
@@ -164,6 +184,9 @@ function FileViewerContent({
   autoFocus,
   onDirtyChange,
   onSaveStatusChange,
+  onSaveError,
+  preview,
+  sourceSide,
   saveRef,
   downloadSourceRef,
   discardRef,
@@ -180,13 +203,17 @@ function FileViewerContent({
   const category = resolveFileCategory(file.type, file.name)
 
   if (category === 'text-editable') {
+    if (isCsvStreamOnly(file)) {
+      return readOnly ? (
+        <UnsupportedPreview name={file.name} />
+      ) : (
+        <CsvTablePreview key={file.id} file={file} workspaceId={workspaceId} />
+      )
+    }
+    if (!isTextEditable(file)) {
+      return <UnsupportedPreview name={file.name} reason={TEXT_PREVIEW_SIZE_MESSAGE} />
+    }
     if (readOnly) {
-      // ReadOnlyTextPreview loads the whole file as text; a large CSV would OOM the
-      // browser. CsvTablePreview's streamed fallback is workspace-only, so on the
-      // read-only public path a large CSV is download-only.
-      if (isCsvStreamOnly(file)) {
-        return <UnsupportedPreview name={file.name} />
-      }
       // Markdown renders through the inline rich editor (non-editable) so the public share
       // surface matches the in-app reading experience; canEdit={false} disables autosave,
       // the bubble menu, and every other editing affordance.
@@ -203,12 +230,6 @@ function FileViewerContent({
       }
       return <ReadOnlyTextPreview file={file} workspaceId={workspaceId} />
     }
-    // A large CSV can't be loaded whole into the editor (the browser OOMs on the full text).
-    // Render a streamed, read-only preview of the first rows + an "Import as a table" path instead.
-    if (isCsvStreamOnly(file)) {
-      return <CsvTablePreview key={file.id} file={file} workspaceId={workspaceId} />
-    }
-
     if (isMarkdownFile(file)) {
       return (
         <RichMarkdownEditor
@@ -244,6 +265,9 @@ function FileViewerContent({
         autoFocus={autoFocus}
         onDirtyChange={onDirtyChange}
         onSaveStatusChange={onSaveStatusChange}
+        onSaveError={onSaveError}
+        preview={preview}
+        sourceSide={sourceSide}
         saveRef={saveRef}
         discardRef={discardRef}
         streamingContent={streamingContent}
@@ -386,20 +410,103 @@ function useBlobUrl(workspaceId: string, fileId: string, fileKey: string) {
   return { fileData, isLoading, error, blobUrl, replaceBlobUrl }
 }
 
-/**
- * Shared blob-backed preview for audio and video files — the fetch, blob-URL
- * lifecycle, and error/loading handling are identical; only the rendered
- * player differs.
- */
-const MediaPreview = memo(function MediaPreview({
-  file,
-  workspaceId,
-  kind,
-}: {
+interface MediaPreviewProps {
   file: WorkspaceFileRecord
   workspaceId: string
   kind: 'audio' | 'video'
-}) {
+}
+
+/**
+ * Audio and video preview. Where the content source answers byte ranges the player streams straight
+ * from its URL, so playback and seeking start while the file downloads, at any size. Elsewhere the
+ * file is fetched whole into a blob first.
+ */
+const MediaPreview = memo(function MediaPreview({ file, workspaceId, kind }: MediaPreviewProps) {
+  const source = useFileContentSource()
+  if (!source.servesByteRanges) {
+    return <BufferedMediaPreview file={file} workspaceId={workspaceId} kind={kind} />
+  }
+  /** `v` lets the browser cache the bytes across re-opens; a content write moves the key. */
+  const src = source.buildUrl(file.key, {
+    version: Number(new Date(file.updatedAt)) || file.size,
+  })
+  /** Keyed by URL so a re-resolved key starts the player, and its load state, afresh. */
+  return (
+    <StreamedMediaPlayer key={src} src={src} file={file} workspaceId={workspaceId} kind={kind} />
+  )
+})
+
+function StreamedMediaPlayer({
+  src,
+  file,
+  workspaceId,
+  kind,
+}: MediaPreviewProps & { src: string }) {
+  const [status, setStatus] = useState<'loading' | 'ready' | 'unplayable' | 'unavailable'>(
+    'loading'
+  )
+  const reresolveRecord = useReresolveFileRecord(workspaceId, file.id)
+  const diagnosing = useRef(false)
+
+  /**
+   * A media element reports only that it failed, not why, so the URL is asked directly for its
+   * first byte, which opens storage. A 404 means the key was replaced; the record is re-resolved,
+   * and a moved key re-renders this preview at the new URL. Bytes that are there but would not play
+   * are the browser's format support.
+   */
+  const handleError = useCallback(async () => {
+    if (diagnosing.current) return
+    diagnosing.current = true
+    // boundary-raw-fetch: ranged probe of the binary serve path, which has no contract
+    const probe = await fetch(src, { headers: { Range: 'bytes=0-0' }, cache: 'no-store' }).catch(
+      () => null
+    )
+    await probe?.body?.cancel()
+    if (probe?.status === 404) await reresolveRecord()
+    setStatus(probe?.ok ? 'unplayable' : 'unavailable')
+  }, [src, reresolveRecord])
+
+  /**
+   * The element starts loading as soon as it is in the document, which can be before hydration
+   * attaches its listeners — a small file then finishes before `loadedmetadata` is heard. Reading
+   * the element's own state on mount covers what the listeners missed.
+   */
+  const syncWithElement = useCallback(
+    (media: HTMLMediaElement | null) => {
+      if (!media || status !== 'loading') return
+      if (media.error) void handleError()
+      else if (media.readyState >= HTMLMediaElement.HAVE_METADATA) setStatus('ready')
+    },
+    [status, handleError]
+  )
+
+  if (status === 'unplayable') {
+    return (
+      <UnsupportedPreview
+        name={file.name}
+        reason={`This ${kind} can't be played in your browser. Use the download button to view it.`}
+      />
+    )
+  }
+  if (status === 'unavailable') {
+    return <PreviewError label={kind} error='Failed to fetch file content' />
+  }
+
+  return (
+    <MediaPlayer
+      file={file}
+      kind={kind}
+      src={src}
+      loading={status === 'loading'}
+      mediaRef={syncWithElement}
+      onLoadedMetadata={() => setStatus('ready')}
+      onError={handleError}
+    />
+  )
+}
+
+/** Fetches the whole file into a blob, for content sources that send only whole bodies. */
+function BufferedMediaPreview({ file, workspaceId, kind }: MediaPreviewProps) {
   const {
     fileData,
     isLoading,
@@ -422,27 +529,66 @@ const MediaPreview = memo(function MediaPreview({
     return <PreviewLoadingFrame className='h-full' tone='surface' />
   }
 
+  return <MediaPlayer file={file} kind={kind} src={blobUrl} />
+}
+
+interface MediaPlayerProps {
+  file: WorkspaceFileRecord
+  kind: 'audio' | 'video'
+  src: string | null
+  /** Covers the player until it can describe the media, for players that load in place. */
+  loading?: boolean
+  mediaRef?: (media: HTMLMediaElement | null) => void
+  onLoadedMetadata?: () => void
+  onError?: () => void
+}
+
+function MediaPlayer({
+  file,
+  kind,
+  src,
+  loading,
+  mediaRef,
+  onLoadedMetadata,
+  onError,
+}: MediaPlayerProps) {
   if (kind === 'audio') {
     return (
-      <div className='flex h-full flex-col items-center justify-center gap-4 bg-[var(--surface-1)] p-8'>
+      <div className='relative flex h-full flex-col items-center justify-center gap-4 bg-[var(--surface-1)] p-8'>
         <div className='flex flex-col items-center gap-2 text-center'>
           <Music className='size-[32px] text-[var(--text-muted)]' />
           <p className='text-[14px] text-[var(--text-primary)]'>{file.name}</p>
         </div>
-        {blobUrl && (
+        {src && (
           // biome-ignore lint/a11y/useMediaCaption: audio from workspace files
-          <audio src={blobUrl} controls className='w-full max-w-[480px]' />
+          <audio
+            ref={mediaRef}
+            src={src}
+            controls
+            className='w-full max-w-[480px]'
+            onLoadedMetadata={onLoadedMetadata}
+            onError={onError}
+          />
         )}
+        {loading && PREVIEW_LOADING_OVERLAY}
       </div>
     )
   }
 
   return (
-    <div className='flex h-full items-center justify-center bg-[var(--surface-1)]'>
-      {blobUrl && (
+    <div className='relative flex h-full items-center justify-center bg-[var(--surface-1)]'>
+      {src && (
         // biome-ignore lint/a11y/useMediaCaption: video from workspace files
-        <video src={blobUrl} controls className='max-h-full max-w-full' />
+        <video
+          ref={mediaRef}
+          src={src}
+          controls
+          className='max-h-full max-w-full'
+          onLoadedMetadata={onLoadedMetadata}
+          onError={onError}
+        />
       )}
+      {loading && PREVIEW_LOADING_OVERLAY}
     </div>
   )
-})
+}

@@ -35,9 +35,10 @@ bun-debug.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# Fumadocs
-/.source/ 
+# Build-generated content
+/.content/
 .plans/
 
-# fumadocs generates .source dirs anywhere a source.config sits
-**/.source/
+# Build-generated documentation asset
+/public/llms-full.txt
+/public/.llms-full-*/

@@ -1,14 +1,6 @@
 import { useRef, useState } from 'react'
+import { AuthButton, AuthField, AuthHeader, AuthInput, AuthRoot, AuthStack } from '@sim/auth-ui'
 import type { DesktopServerConfiguration } from '@sim/desktop-bridge'
-import {
-  ChipModalBody,
-  ChipModalDescription,
-  ChipModalField,
-  ChipModalFooter,
-  ChipModalHeader,
-  ChipModalSurface,
-} from '@sim/emcn'
-import { mountShellModal } from '@/renderer/shell'
 import type { ShellWindowApi } from '@/shared/shell'
 
 interface ServerModalProps {
@@ -22,7 +14,24 @@ function closeWindow() {
 }
 
 function mountServerModal(element: HTMLDivElement | null) {
-  return mountShellModal(element, closeWindow)
+  if (!element) return
+  element.querySelector<HTMLInputElement>('input')?.focus()
+  const host = (window as Window & { simShell?: ShellWindowApi }).simShell
+  const resize = () => host?.resizeContent(Math.ceil(element.scrollHeight))
+  const observer = new ResizeObserver(resize)
+  observer.observe(element)
+  const onKey = (event: KeyboardEvent) => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      closeWindow()
+    }
+  }
+  document.addEventListener('keydown', onKey)
+  resize()
+  return () => {
+    observer.disconnect()
+    document.removeEventListener('keydown', onKey)
+  }
 }
 
 export function ServerModal({ server, configuration, initialError }: ServerModalProps) {
@@ -69,57 +78,81 @@ export function ServerModal({ server, configuration, initialError }: ServerModal
   }
 
   return (
-    <ChipModalSurface
-      ref={mountServerModal}
-      role='dialog'
-      aria-modal='true'
-      aria-labelledby='server-title'
-      aria-describedby='server-description'
-      className='max-h-screen'
-    >
-      <ChipModalHeader
-        onClose={closeWindow}
-        className='[-webkit-app-region:drag] [&_button]:[-webkit-app-region:no-drag]'
+    <AuthRoot>
+      <div
+        ref={mountServerModal}
+        role='dialog'
+        aria-modal='true'
+        aria-label={renaming ? 'Rename account' : addingAccount ? 'Add account' : 'Sim server'}
+        className='au:p-6'
       >
-        <span id='server-title'>
-          {renaming ? 'Rename account' : addingAccount ? 'Add account' : 'Sim server'}
-        </span>
-      </ChipModalHeader>
-      <ChipModalBody>
-        <ChipModalDescription id='server-description'>
-          {renaming
-            ? 'The name shown in the Accounts menu and window titles. Leave it blank to use the signed-in email.'
-            : addingAccount
-              ? 'Sign in to another account in its own window. Enter the server it lives on — the same one again, or a self-hosted deployment.'
-              : 'Point this app at your own Sim deployment. Self-hosted servers must use HTTPS; localhost may use HTTP.'}
-        </ChipModalDescription>
-        <ChipModalField
-          type='input'
-          inputType={renaming ? 'text' : 'url'}
-          title={renaming ? 'Name' : 'Server URL'}
-          value={origin}
-          onChange={(value) => {
-            setOrigin(value)
-            setError(undefined)
-            setMessage('')
-          }}
-          autoComplete='off'
-          placeholder={renaming ? 'Work' : 'https://sim.example.com'}
-          disabled={pending}
-          error={error}
-          hint={
-            <span role='status'>{pending ? (renaming ? 'Saving…' : 'Connecting…') : message}</span>
-          }
-        />
-      </ChipModalBody>
-      <ChipModalFooter
-        onCancel={closeWindow}
-        primaryAction={{
-          label: renaming ? (pending ? 'Saving…' : 'Save') : pending ? 'Connecting…' : 'Connect',
-          onClick: connect,
-          disabled: pending || (!renaming && !origin.trim()),
-        }}
-      />
-    </ChipModalSurface>
+        <AuthStack>
+          <div className='au:[-webkit-app-region:drag]'>
+            <AuthHeader
+              title={renaming ? 'Rename account' : addingAccount ? 'Add account' : 'Sim server'}
+              description={
+                renaming
+                  ? 'The name shown in the Accounts menu and window titles. Leave it blank to use the signed-in email.'
+                  : addingAccount
+                    ? 'Sign in to another account in its own window, on sim.ai or a self-hosted deployment.'
+                    : 'Connect to your organization’s Sim deployment.'
+              }
+            />
+          </div>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault()
+              void connect()
+            }}
+            className='au:space-y-5'
+          >
+            <AuthField
+              htmlFor='server-origin'
+              label={renaming ? 'Name' : 'Server URL'}
+              errors={error ? [error] : undefined}
+              hint={
+                <>
+                  {!renaming && (
+                    <span>Use HTTPS for self-hosted servers. Localhost may use HTTP.</span>
+                  )}
+                  <span role='status'>{message && ` ${message}`}</span>
+                </>
+              }
+            >
+              <AuthInput
+                id='server-origin'
+                type={renaming ? 'text' : 'url'}
+                value={origin}
+                onChange={(event) => {
+                  setOrigin(event.target.value)
+                  setError(undefined)
+                  setMessage('')
+                }}
+                autoComplete='off'
+                placeholder={renaming ? 'Work' : 'https://sim.example.com'}
+                disabled={pending}
+                error={Boolean(error)}
+                aria-describedby='server-origin-hint'
+              />
+            </AuthField>
+            <div className='au:grid au:grid-cols-2 au:gap-2'>
+              <AuthButton onClick={closeWindow} fullWidth>
+                Cancel
+              </AuthButton>
+              <AuthButton
+                type='submit'
+                variant='primary'
+                disabled={!renaming && !origin.trim()}
+                loading={pending}
+                loadingLabel={renaming ? 'Saving…' : 'Connecting…'}
+                fullWidth
+              >
+                {renaming ? 'Save' : 'Connect'}
+              </AuthButton>
+            </div>
+          </form>
+        </AuthStack>
+      </div>
+    </AuthRoot>
   )
 }

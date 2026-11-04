@@ -21,7 +21,11 @@ export function ProjectIssueRestrictions({
   onChange,
 }: ProjectIssueRestrictionsProps) {
   const projects = useProjects(organizationId)
-  if (projects.isPending || (isApiClientError(projects.error) && projects.error.status === 503)) {
+  if (
+    !projects.isEnabled ||
+    projects.isPending ||
+    (isApiClientError(projects.error) && projects.error.status === 503)
+  ) {
     return null
   }
   const choices = projects.data?.pages.flatMap((page) => page.projects) ?? []
@@ -48,7 +52,7 @@ export function ProjectIssueRestrictions({
       }
     >
       {projects.error && (
-        <p className='pl-2 text-[var(--text-error)] text-caption'>{projects.error.message}</p>
+        <p className='pl-2 text-[var(--text-muted)] text-caption'>{projects.error.message}</p>
       )}
       <div className='flex flex-col gap-0.5'>
         {choices.map((project) => (

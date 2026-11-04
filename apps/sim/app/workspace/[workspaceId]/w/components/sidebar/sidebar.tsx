@@ -33,7 +33,9 @@ import {
   PanelLeft,
   Pin,
   Plus,
+  Rss,
   Search,
+  ShieldCheck,
   Table,
   Task,
   Workflow,
@@ -41,7 +43,8 @@ import {
 import { createLogger } from '@sim/logger'
 import { useParams, usePathname, useRouter } from 'next/navigation'
 import { usePostHog } from 'posthog-js/react'
-import { useSession } from '@/lib/auth/auth-client'
+import type { DesktopChatActivity } from '@/lib/api/contracts/desktop-executor'
+import { useSession } from '@/lib/auth/client'
 import { canViewWorkspaceBillingSettings } from '@/lib/billing/workspace-permissions'
 import { focusVisibleBrowserOmnibox } from '@/lib/browser-agent/renderer-shortcuts'
 import { useDeploymentShape } from '@/lib/core/config/deployment-shape'
@@ -49,6 +52,7 @@ import { isStatusNoticePreviewEnabled } from '@/lib/core/config/env-flags'
 import { isMacPlatform } from '@/lib/core/utils/platform'
 import { buildFolderTree, getFolderPathNames } from '@/lib/folders/tree'
 import { DOCS_URL, SLACK_COMMUNITY_URL } from '@/lib/help-links'
+import { isIntegrationUsable } from '@/lib/integrations/access'
 import { SIM_RESOURCES_DRAG_TYPE } from '@/lib/mothership/resource-types'
 import { captureEvent } from '@/lib/posthog/client'
 import { LOGO_ACCEPT_ATTRIBUTE } from '@/lib/uploads/client/logo-file'
@@ -62,7 +66,7 @@ import {
   allNavigationItems,
   type SettingsSection,
 } from '@/app/workspace/[workspaceId]/settings/navigation'
-import { createCommands } from '@/app/workspace/[workspaceId]/utils/commands-utils'
+import { createCommands } from '@/app/workspace/[workspaceId]/utils/commands'
 import {
   ChatNavigationLink,
   CollapsedChatFlyoutItem,
@@ -123,6 +127,7 @@ import { useImportWorkflow } from '@/app/workspace/[workspaceId]/w/hooks'
 import { useCustomBlockOverlayVersion } from '@/blocks/custom/client-overlay'
 import { useWorkspaceAccessRequestFeatures } from '@/ee/access-requests/components/permission-access-boundary'
 import { useWorkspaceCredentials } from '@/hooks/queries/credentials'
+import { useDesktopActivity, watchesDesktopActivity } from '@/hooks/queries/desktop-activity'
 import { useFolderMap, useFolders } from '@/hooks/queries/folders'
 import { type LogFilters, useLogsList } from '@/hooks/queries/logs'
 import type { MothershipChatMetadata } from '@/hooks/queries/mothership-chats'
@@ -140,6 +145,7 @@ import { useUserProfile } from '@/hooks/queries/user-profile'
 import { useUpdateWorkflow } from '@/hooks/queries/workflows'
 import type { Workspace } from '@/hooks/queries/workspace'
 import { useContextMenu } from '@/hooks/use-context-menu'
+import { useIntegrationAccess } from '@/hooks/use-integration-access'
 import { useMothershipChatEvents } from '@/hooks/use-mothership-chat-events'
 import { usePermissionConfig } from '@/hooks/use-permission-config'
 import { useSettingsNavigation } from '@/hooks/use-settings-navigation'
@@ -149,7 +155,6 @@ import { useFilterStore } from '@/stores/logs/filters/store'
 import { useSearchModalStore } from '@/stores/modals/search/store'
 import { useProvidersStore } from '@/stores/providers'
 import { useSettingsDirtyStore } from '@/stores/settings/dirty/store'
-import { useSidebarStore } from '@/stores/sidebar/store'
 
 const logger = createLogger('Sidebar')
 
@@ -183,6 +188,37 @@ const SEARCH_MODAL_DATE_FORMAT = new Intl.DateTimeFormat(undefined, {
   minute: '2-digit',
 })
 
+const DESKTOP_ACTIVITY_COLOR_CLASS: Record<DesktopChatActivity['state'], string> = {
+  running: 'bg-[#EAB308]',
+  needs_input: 'bg-[var(--warning)]',
+  blocked: 'bg-[var(--text-error)]',
+}
+
+function desktopActivityLabel({ state, deviceName }: DesktopChatActivity): string {
+  if (state === 'needs_input') return 'Needs input'
+  if (state === 'blocked') return `Waiting for ${deviceName} to come back online`
+  return `Running on ${deviceName}`
+}
+
+interface DesktopActivityDotProps {
+  activity: DesktopChatActivity
+}
+
+/**
+ * The status of a chat one of the user's desktops is running in the background. The row's
+ * indicator slot is pointer-inert and gives way to the row's actions on hover, so the label is
+ * read out here and shown in the row's own tooltip.
+ */
+function DesktopActivityDot({ activity }: DesktopActivityDotProps) {
+  return (
+    <span
+      role='img'
+      aria-label={desktopActivityLabel(activity)}
+      className={cn('size-[6px] rounded-full', DESKTOP_ACTIVITY_COLOR_CLASS[activity.state])}
+    />
+  )
+}
+
 const SidebarChatItem = memo(function SidebarChatItem({
   chat,
   isCurrentRoute,
@@ -190,6 +226,7 @@ const SidebarChatItem = memo(function SidebarChatItem({
   isActive,
   isUnread,
   isPinned,
+  desktopActivity,
   isMenuOpen,
   showCollapsedTooltips,
   onMultiSelectClick,
@@ -203,6 +240,8 @@ const SidebarChatItem = memo(function SidebarChatItem({
   isActive: boolean
   isUnread: boolean
   isPinned: boolean
+  /** Set while one of the user's desktops runs this chat's turn in the background. */
+  desktopActivity?: DesktopChatActivity
   isMenuOpen: boolean
   showCollapsedTooltips: boolean
   onMultiSelectClick: (chatId: string, shiftKey: boolean) => void
@@ -217,7 +256,7 @@ const SidebarChatItem = memo(function SidebarChatItem({
    * transient state (a run in progress, or an unread reply elsewhere), while pinning
    * is persistent and already conveyed by the row sorting to the top of the list.
    */
-  const showStatusDot = isActive || (!isCurrentRoute && isUnread)
+  const showStatusDot = Boolean(desktopActivity) || isActive || (!isCurrentRoute && isUnread)
 
   function handleDragStart(e: React.DragEvent) {
     e.dataTransfer.effectAllowed = 'copyMove'
@@ -239,7 +278,12 @@ const SidebarChatItem = memo(function SidebarChatItem({
   }
 
   return (
-    <SidebarTooltip label={chat.name} enabled={showCollapsedTooltips}>
+    <SidebarTooltip
+      label={
+        desktopActivity ? `${chat.name} · ${desktopActivityLabel(desktopActivity)}` : chat.name
+      }
+      enabled={showCollapsedTooltips || Boolean(desktopActivity)}
+    >
       <ChatNavigationLink
         chatId={chat.id}
         href={chat.href}
@@ -262,7 +306,9 @@ const SidebarChatItem = memo(function SidebarChatItem({
           <RowActions
             open={isMenuOpen}
             indicator={
-              showStatusDot ? (
+              desktopActivity ? (
+                <DesktopActivityDot activity={desktopActivity} />
+              ) : showStatusDot ? (
                 <span
                   aria-hidden='true'
                   className='size-[6px] rounded-full'
@@ -329,6 +375,11 @@ const DRAG_EXEMPT_CLASS = '[-webkit-app-region:no-drag]'
 
 interface SidebarProps {
   organizationHref: string | null
+  /**
+   * Whether this install runs the desktop background executor, and whether the user has a desktop
+   * registered to run their turns, so chats show desktop activity.
+   */
+  desktopExecutor: { available: boolean; registered: boolean }
 }
 
 /**
@@ -347,8 +398,8 @@ interface SidebarProps {
  *
  * @returns Sidebar with workflows panel
  */
-export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps) {
-  const { isCollapsed: isCollapsedProp, isPeeking } = useSidebarChrome()
+export const Sidebar = memo(function Sidebar({ organizationHref, desktopExecutor }: SidebarProps) {
+  const { isCollapsed: isCollapsedProp, isPeeking, onToggle: toggleCollapsed } = useSidebarChrome()
   const isCollapsed = isCollapsedProp && !isPeeking
   const params = useParams()
   const workspaceId = params.workspaceId as string
@@ -370,12 +421,12 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
   const {
     config: permissionConfig,
     filterBlocks,
-    isBlockAllowed,
     isToolAllowed,
     integrationAvailability,
   } = usePermissionConfig()
+  const { getAccess: getIntegrationAccess } = useIntegrationAccess(workspaceId)
   const accessRequests = useWorkspaceAccessRequestFeatures()
-  const accessRequestsEnabled = accessRequests.data?.enabled === true
+  const requestableFeatureKeys = accessRequests.requestableFeatureKeys
   const { getSettingsHref, navigateToSettings } = useSettingsNavigation()
   const initializeSearchData = useSearchModalStore((state) => state.initializeData)
   const customBlockOverlayVersion = useCustomBlockOverlayVersion()
@@ -397,8 +448,6 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
     providerModelSignature,
     customBlockOverlayVersion,
   ])
-
-  const toggleCollapsed = useSidebarStore((state) => state.toggleCollapsed)
 
   const isMac = isMacPlatform()
   const showCollapsedTooltips = isCollapsed
@@ -705,6 +754,8 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
   )
 
   const dashboardsEnabled = useFeatureFlag('dashboards')
+  const testsEnabled = useFeatureFlag('workflow-tests')
+  const changelogEnabled = useFeatureFlag('changelog')
   const topNavItems = useMemo(
     () =>
       [
@@ -718,7 +769,9 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
           // on a workflow the server declined to create.
           hidden:
             (!chatEnabled && !permissionsLoading && !canEdit) ||
-            (chatEnabled && permissionConfig.hideCopilot && !accessRequestsEnabled),
+            (chatEnabled &&
+              permissionConfig.hideCopilot &&
+              !requestableFeatureKeys.has('hideCopilot')),
           restricted: chatEnabled && permissionConfig.hideCopilot,
         },
         {
@@ -726,7 +779,19 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
           label: 'Dashboard',
           icon: Dashboard,
           href: `/workspace/${workspaceId}/dashboards`,
-          hidden: !dashboardsEnabled || (permissionConfig.hideFilesTab && !accessRequestsEnabled),
+          hidden:
+            !dashboardsEnabled ||
+            (permissionConfig.hideFilesTab && !requestableFeatureKeys.has('hideFilesTab')),
+          restricted: permissionConfig.hideFilesTab,
+        },
+        {
+          id: 'changelog',
+          label: 'Changelog',
+          icon: Rss,
+          href: `/workspace/${workspaceId}/changelog`,
+          hidden:
+            !changelogEnabled ||
+            (permissionConfig.hideFilesTab && !requestableFeatureKeys.has('hideFilesTab')),
           restricted: permissionConfig.hideFilesTab,
         },
         {
@@ -735,7 +800,9 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
           icon: Integration,
           href: `/workspace/${workspaceId}/integrations`,
           additionalActivePaths: [`/workspace/${workspaceId}/skills`],
-          hidden: permissionConfig.hideIntegrationsTab && !accessRequestsEnabled,
+          hidden:
+            permissionConfig.hideIntegrationsTab &&
+            !requestableFeatureKeys.has('hideIntegrationsTab'),
           restricted: permissionConfig.hideIntegrationsTab,
         },
       ].filter((item) => !item.hidden),
@@ -747,9 +814,10 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
       permissionConfig.hideIntegrationsTab,
       permissionConfig.hideCopilot,
       permissionConfig.hideFilesTab,
-      accessRequestsEnabled,
+      requestableFeatureKeys,
       chatEnabled,
       dashboardsEnabled,
+      changelogEnabled,
     ]
   )
 
@@ -761,7 +829,7 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
           label: 'Tables',
           icon: Table,
           href: `/workspace/${workspaceId}/tables`,
-          hidden: permissionConfig.hideTablesTab && !accessRequestsEnabled,
+          hidden: permissionConfig.hideTablesTab && !requestableFeatureKeys.has('hideTablesTab'),
           restricted: permissionConfig.hideTablesTab,
         },
         {
@@ -769,7 +837,7 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
           label: 'Files',
           icon: Files,
           href: `/workspace/${workspaceId}/files`,
-          hidden: permissionConfig.hideFilesTab && !accessRequestsEnabled,
+          hidden: permissionConfig.hideFilesTab && !requestableFeatureKeys.has('hideFilesTab'),
           restricted: permissionConfig.hideFilesTab,
         },
         {
@@ -777,8 +845,20 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
           label: 'Knowledge bases',
           icon: Database,
           href: `/workspace/${workspaceId}/knowledge`,
-          hidden: permissionConfig.hideKnowledgeBaseTab && !accessRequestsEnabled,
+          hidden:
+            permissionConfig.hideKnowledgeBaseTab &&
+            !requestableFeatureKeys.has('hideKnowledgeBaseTab'),
           restricted: permissionConfig.hideKnowledgeBaseTab,
+        },
+        {
+          id: 'tests',
+          label: 'Tests',
+          icon: ShieldCheck,
+          href: `/workspace/${workspaceId}/tests`,
+          hidden:
+            !testsEnabled ||
+            (permissionConfig.hideFilesTab && !requestableFeatureKeys.has('hideFilesTab')),
+          restricted: permissionConfig.hideFilesTab,
         },
         {
           id: 'logs',
@@ -793,7 +873,8 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
       permissionConfig.hideFilesTab,
       permissionConfig.hideKnowledgeBaseTab,
       permissionConfig.hideTablesTab,
-      accessRequestsEnabled,
+      requestableFeatureKeys,
+      testsEnabled,
     ]
   )
 
@@ -842,7 +923,20 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
     { enabled: chatEnabled && !permissionConfig.hideCopilot }
   )
 
-  useMothershipChatEvents(workspaceId, chatEnabled && !permissionConfig.hideCopilot)
+  const desktopActivityWatched = watchesDesktopActivity(desktopExecutor)
+  useMothershipChatEvents(
+    workspaceId,
+    chatEnabled && !permissionConfig.hideCopilot,
+    desktopActivityWatched
+  )
+  const desktopActivity = useDesktopActivity(
+    workspaceId,
+    desktopActivityWatched && chatEnabled && !permissionConfig.hideCopilot
+  )
+  const desktopActivityByChat = useMemo(
+    () => new Map((desktopActivity ?? []).map((activity) => [activity.chatId, activity])),
+    [desktopActivity]
+  )
 
   /**
    * Stays empty when Chat is disabled, which also drops the command palette's
@@ -1056,14 +1150,22 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
     () =>
       permissionConfig.hideIntegrationsTab
         ? []
-        : buildIntegrationSearchItems(workspaceId, isBlockAllowed, (blockType) => {
-            const availability = integrationAvailability.get(blockType.toLowerCase())
-            if (!availability) return CONNECT_MODE.oauth
-            if (availability?.oauthAvailable) return CONNECT_MODE.oauth
-            if (availability?.state === 'limited') return CONNECT_MODE.serviceAccount
-            return null
-          }),
-    [workspaceId, permissionConfig.hideIntegrationsTab, isBlockAllowed, integrationAvailability]
+        : buildIntegrationSearchItems(
+            workspaceId,
+            (blockType) => isIntegrationUsable(getIntegrationAccess(blockType)),
+            (blockType) => {
+              const availability = integrationAvailability.get(blockType.toLowerCase())
+              if (!availability || availability.oauthAvailable) return CONNECT_MODE.oauth
+              if (availability.state === 'limited') return CONNECT_MODE.serviceAccount
+              return null
+            }
+          ),
+    [
+      workspaceId,
+      permissionConfig.hideIntegrationsTab,
+      getIntegrationAccess,
+      integrationAvailability,
+    ]
   )
 
   const searchModalConnectedAccounts = useMemo(
@@ -1363,7 +1465,7 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
               <div
                 inert={isCollapsed}
                 className={cn(
-                  'flex h-[30px] items-center gap-[1px] overflow-hidden',
+                  'flex h-[30px] items-center gap-[1px] overflow-hidden max-md:min-h-11 max-md:w-11',
                   isCollapsed
                     ? 'w-0 opacity-0'
                     : 'w-[65px] [[data-sim-desktop-title-bar=inset]_&]:w-[32px]'
@@ -1398,7 +1500,7 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
                     tabIndex={isCollapsed ? -1 : undefined}
                     className={cn(
                       DRAG_EXEMPT_CLASS,
-                      '[[data-sim-desktop-title-bar=inset]_&]:hidden'
+                      'max-md:hidden [[data-sim-desktop-title-bar=inset]_&]:hidden'
                     )}
                   />
                 </SidebarTooltip>
@@ -1537,6 +1639,7 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
                                       isActive={!!chat.isActive}
                                       isUnread={!!chat.isUnread}
                                       isPinned={!!chat.isPinned}
+                                      desktopActivity={desktopActivityByChat.get(chat.id)}
                                       isMenuOpen={menuOpenChatId === chat.id}
                                       showCollapsedTooltips={showCollapsedTooltips}
                                       onMultiSelectClick={handleChatClick}
@@ -1835,7 +1938,7 @@ export const Sidebar = memo(function Sidebar({ organizationHref }: SidebarProps)
         {!isPeeking && (
           <div
             className={cn(
-              'absolute top-0 right-0 bottom-0 z-20 w-[8px] translate-x-1/2',
+              'absolute top-0 right-0 bottom-0 z-20 hidden w-[8px] translate-x-1/2 md:block',
               isCollapsed ? 'cursor-e-resize' : 'cursor-ew-resize'
             )}
             onPointerDown={isCollapsed ? undefined : handlePointerDown}

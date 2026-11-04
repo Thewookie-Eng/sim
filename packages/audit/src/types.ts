@@ -3,6 +3,13 @@
  */
 export const AuditAction = {
   ACCOUNT_DELETED: 'account.deleted',
+  AUTH_LOGIN_SUCCEEDED: 'auth.login_succeeded',
+  AUTH_LOGIN_FAILED: 'auth.login_failed',
+  AUTH_LOGOUT: 'auth.logout',
+  AUTH_IMPERSONATION_STARTED: 'auth.impersonation_started',
+  AUTH_IMPERSONATION_ENDED: 'auth.impersonation_ended',
+  AUTH_SESSIONS_REVOKED: 'auth.sessions_revoked',
+  AUDIT_LOGS_EXPORTED: 'audit_logs.exported',
 
   API_KEY_CREATED: 'api_key.created',
   API_KEY_UPDATED: 'api_key.updated',
@@ -19,8 +26,12 @@ export const AuditAction = {
 
   CHAT_DEPLOYED: 'chat.deployed',
   CHAT_UPDATED: 'chat.updated',
+  ASSISTANT_ACTION_REVIEWED: 'assistant_action.reviewed',
   CHAT_DELETED: 'chat.deleted',
   CHAT_PASSWORD_VIEWED: 'chat.password_viewed',
+
+  CHANGELOG_RELEASE_PUBLISHED: 'changelog_release.published',
+  CHANGELOG_RELEASE_UPDATED: 'changelog_release.updated',
 
   // Custom Blocks (deploy-as-block)
   CUSTOM_BLOCK_PUBLISHED: 'custom_block.published',
@@ -45,6 +56,7 @@ export const AuditAction = {
   INVOICE_PAYMENT_SUCCEEDED: 'invoice.payment_succeeded',
   INVOICE_PAYMENT_FAILED: 'invoice.payment_failed',
   OVERAGE_BILLED: 'billing.overage_billed',
+  BILLING_SYNC_RESOLVED: 'billing.sync_resolved',
   CHARGE_DISPUTE_OPENED: 'charge.dispute_opened',
   CHARGE_DISPUTE_CLOSED: 'charge.dispute_closed',
 
@@ -119,6 +131,7 @@ export const AuditAction = {
   KNOWLEDGE_BASE_DELETED: 'knowledge_base.deleted',
   KNOWLEDGE_BASE_RESTORED: 'knowledge_base.restored',
   KNOWLEDGE_BASE_EXPORTED: 'knowledge_base.exported',
+  KNOWLEDGE_BASE_IMPORT_STARTED: 'knowledge_base.import_started',
 
   MCP_SERVER_ADDED: 'mcp_server.added',
   MCP_SERVER_UPDATED: 'mcp_server.updated',
@@ -149,6 +162,9 @@ export const AuditAction = {
   ORGANIZATION_DELETED: 'organization.deleted',
   ORGANIZATION_SESSION_POLICY_UPDATED: 'organization.session_policy.updated',
   ORGANIZATION_SSO_POLICY_UPDATED: 'organization.sso_policy.updated',
+  ORGANIZATION_SSO_PROVIDER_CREATED: 'organization.sso_provider.created',
+  ORGANIZATION_SSO_PROVIDER_UPDATED: 'organization.sso_provider.updated',
+  ORGANIZATION_SSO_PROVIDER_DELETED: 'organization.sso_provider.deleted',
   ORGANIZATION_SESSIONS_REVOKED: 'organization.sessions.revoked',
   ORGANIZATION_DOMAIN_ADDED: 'organization.domain.added',
   ORGANIZATION_DOMAIN_VERIFIED: 'organization.domain.verified',
@@ -158,6 +174,11 @@ export const AuditAction = {
   ORG_MEMBER_REMOVED: 'org_member.removed',
   ORG_MEMBER_ROLE_CHANGED: 'org_member.role_changed',
   ORG_MEMBER_USAGE_LIMIT_CHANGED: 'org_member.usage_limit_changed',
+  ORG_MEMBER_PROFILE_UPDATED: 'org_member.profile_updated',
+  ORG_PEOPLE_IMPORTED: 'org_people.imported',
+  ORG_PEOPLE_SYNC_CONFIGURED: 'org_people.sync_configured',
+  ORG_PEOPLE_SYNC_REQUESTED: 'org_people.sync_requested',
+  ORG_PEOPLE_SYNC_DISCONNECTED: 'org_people.sync_disconnected',
   ORG_INVITATION_CREATED: 'org_invitation.created',
   ORG_INVITATION_UPDATED: 'org_invitation.updated',
   ORG_INVITATION_ACCEPTED: 'org_invitation.accepted',
@@ -198,6 +219,9 @@ export const AuditAction = {
   SCHEDULE_CREATED: 'schedule.created',
   SCHEDULE_UPDATED: 'schedule.updated',
   SCHEDULE_DELETED: 'schedule.deleted',
+  SIM_LINK_CREATED: 'sim_link.created',
+  SIM_LINK_UPDATED: 'sim_link.updated',
+  SIM_LINK_DELETED: 'sim_link.deleted',
 
   TABLE_CREATED: 'table.created',
   TABLE_UPDATED: 'table.updated',
@@ -263,6 +287,7 @@ export const AuditResourceType = {
   API_KEY: 'api_key',
   BILLING: 'billing',
   BYOK_KEY: 'byok_key',
+  CHANGELOG_RELEASE: 'changelog_release',
   CHAT: 'chat',
   CONNECTOR: 'connector',
   CREDENTIAL: 'credential',
@@ -291,6 +316,7 @@ export const AuditResourceType = {
   SCIM_GROUP: 'scim_group',
   /** Not a stored resource: the workspace's secrets, as the thing put at risk. */
   SECRET_PROVENANCE: 'secret_provenance',
+  SIM_LINK: 'sim_link',
   SKILL: 'skill',
   SUBSCRIPTION: 'subscription',
   TABLE: 'table',

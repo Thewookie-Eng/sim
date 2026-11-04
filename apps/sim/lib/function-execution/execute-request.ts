@@ -27,13 +27,13 @@ import {
   type CompiledCodePlaceholders,
   compileCodePlaceholders,
 } from '@/lib/execution/code-placeholders'
+import { parseExecutionDeadlineHeader } from '@/lib/execution/deadline-header'
 import {
   type DurableSecretProvenance,
   durableSecretProvenanceFromEnvelope,
   importDurableSecretProvenance,
   mergeDurableSecretProvenance,
 } from '@/lib/execution/durable-secret-provenance'
-import { parseExecutionDeadlineHeader } from '@/lib/execution/execution-deadline-header'
 import { executeInIsolatedVM, type IsolatedVMBrokerHandler } from '@/lib/execution/isolated-vm'
 import { CodeLanguage, DEFAULT_CODE_LANGUAGE, isValidCodeLanguage } from '@/lib/execution/languages'
 import {
@@ -80,7 +80,8 @@ import {
   executeShellInSandbox,
   SIM_RESULT_PREFIX,
 } from '@/lib/execution/remote-sandbox'
-import { sandboxSessionInputProvenance } from '@/lib/execution/remote-sandbox/execution-observer'
+import { isBinarySandboxPath } from '@/lib/execution/remote-sandbox/encoding'
+import { sandboxSessionInputProvenance } from '@/lib/execution/remote-sandbox/observer'
 import {
   isSandboxOutputFileError,
   isSandboxOutputLimitError,
@@ -88,11 +89,11 @@ import {
   MAX_SANDBOX_OUTPUT_BYTES,
   readTrustedSandboxOutputCost,
 } from '@/lib/execution/remote-sandbox/output-limits'
-import { isBinarySandboxPath } from '@/lib/execution/remote-sandbox/sandbox-encoding'
+import { MAX_BLOCK_MOUNTED_FILES, SANDBOX_OUTPUT_DIR } from '@/lib/execution/remote-sandbox/paths'
 import {
-  MAX_BLOCK_MOUNTED_FILES,
-  SANDBOX_OUTPUT_DIR,
-} from '@/lib/execution/remote-sandbox/sandbox-paths'
+  describeSandboxTimeoutProgress,
+  SandboxExecutionTimeoutError,
+} from '@/lib/execution/remote-sandbox/timeout'
 import type {
   SandboxCollectedFile,
   SandboxFile,
@@ -115,7 +116,7 @@ import {
   validateWorkspaceFileWriteTarget,
   writeWorkspaceFileByPath,
 } from '@/lib/mothership/vfs/resource-writer'
-import { uploadExecutionFile } from '@/lib/uploads/contexts/execution/execution-file-manager'
+import { uploadExecutionFile } from '@/lib/uploads/contexts/execution/file-manager'
 import {
   createWorkspaceFileSecretProvenanceFromRegistry,
   EXACT_EMPTY_WORKSPACE_FILE_SECRET_PROVENANCE,
@@ -124,9 +125,9 @@ import {
   mergeWorkspaceFileSecretProvenance,
   type WorkspaceFileSecretProvenance,
   type WorkspaceFileSecretProvenanceIdentity,
-} from '@/lib/uploads/contexts/workspace/workspace-file-secret-provenance'
+} from '@/lib/uploads/contexts/workspace/file-secret-provenance'
 import { deleteFiles } from '@/lib/uploads/core/storage-service'
-import { getFileExtension, getMimeTypeFromExtension } from '@/lib/uploads/utils/file-utils'
+import { getFileExtension, getMimeTypeFromExtension } from '@/lib/uploads/utils/file'
 import { getWorkflowById } from '@/lib/workflows/utils'
 import { rebindWorkspaceFileDelegatedPrincipal } from '@/lib/workspace-files/application/delegated-principal'
 import { fileOperations } from '@/lib/workspace-files/application/operations'
@@ -2466,7 +2467,7 @@ export async function executeFunctionRequest(
     const executionParams = { ...params }
     executionParams._context = undefined
 
-    logger.info(`[${requestId}] Function execution request`, {
+    logger.debug(`[${requestId}] Function execution request`, {
       hasCode: !!code,
       paramsCount: Object.keys(executionParams).length,
       timeout,
@@ -2830,6 +2831,7 @@ export async function executeFunctionRequest(
         collectedFiles: shellCollectedFiles,
         cost: shellCost,
         sandboxSession: shellSandboxSession,
+        phaseMs: shellPhaseMs,
       } = await executeShellInSandbox({
         code: resolvedCode,
         envs: shellEnvs,
@@ -2854,6 +2856,8 @@ export async function executeFunctionRequest(
         sandboxId,
         succeeded: !shellError,
         executionTime,
+        sandboxSession: shellSandboxSession,
+        phaseMs: shellPhaseMs,
       })
 
       if (shellError) {
@@ -2984,6 +2988,7 @@ export async function executeFunctionRequest(
           collectedFiles: jsCollectedFiles,
           cost: sandboxCost,
           sandboxSession: jsSandboxSession,
+          phaseMs: jsPhaseMs,
         } = await executeInSandbox({
           code: codeForE2B,
           language: CodeLanguage.JavaScript,
@@ -3009,6 +3014,9 @@ export async function executeFunctionRequest(
         logger.info(`[${requestId}] E2B JS sandbox`, {
           sandboxId,
           succeeded: !e2bError,
+          executionTime,
+          sandboxSession: jsSandboxSession,
+          phaseMs: jsPhaseMs,
         })
 
         if (e2bError) {
@@ -3113,6 +3121,7 @@ export async function executeFunctionRequest(
         collectedFiles: pythonCollectedFiles,
         cost: sandboxCost,
         sandboxSession: pythonSandboxSession,
+        phaseMs: pythonPhaseMs,
       } = await executeInSandbox({
         code: codeForE2B,
         language: CodeLanguage.Python,
@@ -3137,6 +3146,9 @@ export async function executeFunctionRequest(
       logger.info(`[${requestId}] E2B Py sandbox`, {
         sandboxId,
         succeeded: !e2bError,
+        executionTime,
+        sandboxSession: pythonSandboxSession,
+        phaseMs: pythonPhaseMs,
       })
 
       if (e2bError) {
@@ -3272,12 +3284,6 @@ export async function executeFunctionRequest(
       }
 
       const isSystemError = isolatedResult.error.isSystemError === true
-      const logFn = isSystemError ? logger.error.bind(logger) : logger.warn.bind(logger)
-      logFn(`[${requestId}] Function execution failed in isolated-vm`, {
-        executionTime,
-        isSystemError,
-        hasStack: Boolean(isolatedResult.error.stack),
-      })
 
       const ivmError = isolatedResult.error
       let adjustedLine = ivmError.line
@@ -3307,11 +3313,15 @@ export async function executeFunctionRequest(
         errorDisplayCode
       )
 
-      const detailLogFn = isSystemError ? logger.error.bind(logger) : logger.warn.bind(logger)
-      detailLogFn(`[${requestId}] Enhanced error details`, {
-        line: enhancedError.line,
-        column: enhancedError.column,
-      })
+      /** The author's code throwing is logged once by the tool boundary; an isolate failure is ours. */
+      if (isSystemError) {
+        logger.error(`[${requestId}] Function execution failed in isolated-vm`, {
+          executionTime,
+          hasStack: Boolean(ivmError.stack),
+          line: enhancedError.line,
+          column: enhancedError.column,
+        })
+      }
 
       return functionJsonResponse(
         {
@@ -3335,7 +3345,7 @@ export async function executeFunctionRequest(
       )
     }
 
-    logger.info(`[${requestId}] Function executed successfully using ${executionMethod}`, {
+    logger.debug(`[${requestId}] Function executed successfully using ${executionMethod}`, {
       executionTime,
     })
 
@@ -3355,12 +3365,24 @@ export async function executeFunctionRequest(
         isTimeoutAbortReason(req.signal.reason) ||
         isTimeoutAbortReason(error?.cause ?? error) ||
         (executionDeadlineAt !== undefined && Date.now() >= executionDeadlineAt)
+      const timeoutMessage = `Function execution timed out${timeoutForError ? ` after ${timeoutForError}ms` : ''}`
+      // Only a route context carries the secret provenance that partial output must cross with.
+      const progress =
+        timedOut && routeContext && error instanceof SandboxExecutionTimeoutError
+          ? error.progress
+          : undefined
       const abortResponse = {
         success: false,
-        error: timedOut
-          ? `Function execution timed out${timeoutForError ? ` after ${timeoutForError}ms` : ''}`
-          : 'Function execution was cancelled',
-        output: { result: null, stdout: cleanStdout(stdout), executionTime },
+        error: !timedOut
+          ? 'Function execution was cancelled'
+          : progress
+            ? `${timeoutMessage}.${describeSandboxTimeoutProgress(progress)}`
+            : timeoutMessage,
+        output: {
+          result: null,
+          stdout: cleanStdout(progress ? progress.output : stdout),
+          executionTime,
+        },
       }
       logger.warn(`[${requestId}] Function execution ${timedOut ? 'timed out' : 'was cancelled'}`, {
         executionTime,
@@ -3498,11 +3520,6 @@ export async function executeFunctionRequest(
           )
     }
 
-    logger.error(`[${requestId}] Function execution failed`, {
-      executionTime,
-      hasStack: Boolean(error.stack),
-    })
-
     const errorDisplayCode = getErrorDisplayCode(sourceCodeForErrors, resolvedCode)
     const enhancedError = extractEnhancedError(error, userCodeStartLine, errorDisplayCode)
     const userFriendlyErrorMessage = scrubInternalIdentifiers(
@@ -3510,7 +3527,9 @@ export async function executeFunctionRequest(
       compilerInternalIdentifiers
     )
 
-    logger.error(`[${requestId}] Enhanced error details`, {
+    logger.error(`[${requestId}] Function execution failed`, {
+      executionTime,
+      hasStack: Boolean(error.stack),
       line: enhancedError.line,
       column: enhancedError.column,
       userCodeStartLine,
