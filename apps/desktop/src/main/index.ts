@@ -1,3 +1,4 @@
+import { mkdirSync } from 'node:fs'
 import { release } from 'node:os'
 import { join } from 'node:path'
 import { createLogger } from '@sim/logger'
@@ -78,7 +79,10 @@ import { attachCspFallback } from '@/main/csp'
 import { DesktopChatSessionStore } from '@/main/desktop-chat-session-store'
 import { createApprovalNotifier } from '@/main/desktop-executor/approval-notifier'
 import { createDesktopToolRunner } from '@/main/desktop-executor/runner'
-import { createDesktopExecutorService } from '@/main/desktop-executor/service'
+import {
+  createDesktopExecutorService,
+  type DesktopExecutorService,
+} from '@/main/desktop-executor/service'
 import { createSleepBlocker } from '@/main/desktop-executor/sleep-blocker'
 import { createDesktopSettingsService } from '@/main/desktop-settings'
 import { attachDownloadHandling, countProgressingAppDownloads } from '@/main/downloads'
@@ -295,7 +299,6 @@ function main(): void {
     localFilePermissionsByAccount.set(account.id, permissions)
     return permissions
   }
-  const localFilePermissions = localFilePermissionsFor(primaryAccount())
   /** Full file access is one install-wide switch, so any account's teardown turns it off. */
   const clearLocalFileAccessFor = async (account?: Account) => {
     config.set('fullFileAccess', false)
@@ -559,19 +562,12 @@ function main(): void {
           // sign-out would stream the previous account's output into the next
           // renderer and keep its local processes running invisibly.
           //
-          // The executor, terminals, task state and folder grants are still
-          // process-wide, so signing out of any account clears them for all.
-          ...(isPrimary
-            ? [
-                {
-                  label: 'background executor',
-                  clear: async () => {
-                    approvalNotifier.clear()
-                    await desktopExecutor.signOut()
-                  },
-                },
-              ]
-            : []),
+          // Terminals and task state are still process-wide, so signing out of
+          // any account clears them for all. The executor is the account's own.
+          {
+            label: 'background executor',
+            clear: () => signOutExecutor(account),
+          },
           {
             label: 'terminal sessions',
             // Agent commands are stopped by their own process groups first: closing a shell only
@@ -854,6 +850,8 @@ function main(): void {
     if (!added.ok) return added
     const win = await createAndLoadAppWindow({ account: added.account, route: '/login' })
     showMainWindow(win)
+    // Registers once the new account signs in; its session cookie triggers that.
+    if (executorsStarted) startExecutor(added.account)
     rebuildMenu()
     return { ok: true as const, origin: added.account.origin, unchanged: false }
   }
@@ -877,6 +875,7 @@ function main(): void {
     }
     for (const win of windowsFor(account)) win.destroy()
     runtimes.delete(account.id)
+    executors.delete(account.id)
     localFilesystems.get(account.id)?.close()
     localFilesystems.delete(account.id)
     config.removeAccount(account.id)
@@ -916,7 +915,7 @@ function main(): void {
     // pinned strip survive, so switching back on resumes rather than restarts.
     setBrowserEnabled: (enabled) => {
       if (!enabled) closeAgentBrowserSession()
-      desktopExecutor.refreshRegistration()
+      refreshExecutorRegistrations()
     },
     setTerminalEnabled: (enabled) => {
       // Agent commands are stopped by their process groups first; a tmux run outlives its shell.
@@ -926,7 +925,7 @@ function main(): void {
           if (!desktopSettings.getPreferences().terminalEnabled) terminal.dispose()
         })
       }
-      desktopExecutor.refreshRegistration()
+      refreshExecutorRegistrations()
     },
     setPreventSleepWhileRunning: () => sleepBlocker.refresh(),
     setBrowserTheme: setAgentBrowserTheme,
@@ -960,85 +959,141 @@ function main(): void {
     powerSaveBlocker,
   })
 
-  const approvalNotifier = createApprovalNotifier({
-    preferences: () => desktopSettings.getPreferences(),
-    focusedChatId: () => {
-      const win = focusedAppWindow()
-      if (!win) return null
-      const origin = windowAccounts.get(win)?.origin ?? appOrigin()
-      const route = routeFromAppUrl(win.webContents.getURL(), origin)
-      return route ? (/\/chat\/([^/?#]+)/.exec(route)?.[1] ?? null) : null
-    },
-    openRoute: (route) => void openMainWindowAt(route, primaryAccount()),
-    createNotification: (options) =>
-      Notification.isSupported() ? new Notification(options) : null,
-  })
-
   let agentWorkRunning = false
-  // The executor registers one device per install, bound to the primary
-  // account's session; other accounts' chats run their tools in the foreground.
-  const desktopExecutor = createDesktopExecutorService({
-    userDataPath,
-    origin: () => primaryAccount().origin,
-    appSession: () => primaryRuntime().session,
-    preferences: () => desktopSettings.getPreferences(),
-    accountDataAvailable,
-    onApprovals: (items) => approvalNotifier.update(items),
-    onBusyChange: (busy) => {
-      agentWorkRunning = busy
-      sleepBlocker.setBusy(busy)
-    },
-    // A result the model has makes a tmux run it handed back as still going collectable across a
-    // restart.
-    onResultDelivered: (toolCallId) => terminal.markRunDelivered(toolCallId),
-    // A result the model never got leaves such a run with no one to come back to it, so it is
-    // stopped, as the launch sweep stops a previous process's.
-    onResultNotDelivered: (toolCallId) => void terminal.stopUndeliveredRun(toolCallId),
-    runner: createDesktopToolRunner({
+  const busyAccounts = new Set<string>()
+  interface AccountExecutor {
+    service: DesktopExecutorService
+    approvals: ReturnType<typeof createApprovalNotifier>
+    started: boolean
+  }
+  const executors = new Map<string, AccountExecutor>()
+  let executorsStarted = false
+
+  /**
+   * Each account registers its own device with its own server and session, so
+   * a chat's tools run in the background whichever account it belongs to. The
+   * primary keeps the install id and journal it always had; the others keep
+   * theirs under `accounts/<id>`.
+   */
+  function executorFor(account: Account): DesktopExecutorService {
+    const existing = executors.get(account.id)
+    if (existing) return existing.service
+    const dataPath =
+      account.id === PRIMARY_ACCOUNT_ID ? userDataPath : join(userDataPath, 'accounts', account.id)
+    mkdirSync(dataPath, { recursive: true })
+    const approvalNotifier = createApprovalNotifier({
+      preferences: () => desktopSettings.getPreferences(),
+      focusedChatId: () => {
+        const win = focusedAppWindow()
+        if (!win || windowAccounts.get(win)?.id !== account.id) return null
+        const route = routeFromAppUrl(win.webContents.getURL(), account.origin)
+        return route ? (/\/chat\/([^/?#]+)/.exec(route)?.[1] ?? null) : null
+      },
+      openRoute: (route) => void openMainWindowAt(route, account),
+      createNotification: (options) =>
+        Notification.isSupported() ? new Notification(options) : null,
+    })
+    const browserProfile = () => browserProfileFor(account, ensureRuntime(account).session)
+    const service: DesktopExecutorService = createDesktopExecutorService({
+      userDataPath: dataPath,
+      origin: () => account.origin,
+      appSession: () => ensureRuntime(account).session,
       preferences: () => desktopSettings.getPreferences(),
       accountDataAvailable,
-      browser: {
-        executeTool: (scopeId, tool, params, toolCallId) =>
-          executeAgentBrowserTool(scopeId, tool, params, toolCallId, undefined, {
-            background: true,
-          }),
-        cancelTool: cancelAgentBrowserTool,
-        hasSession: hasBrowserScopeSession,
-        restoreScope: restoreAgentBrowserScope,
+      onApprovals: (items) => approvalNotifier.update(items),
+      onBusyChange: (busy) => {
+        if (busy) busyAccounts.add(account.id)
+        else busyAccounts.delete(account.id)
+        agentWorkRunning = busyAccounts.size > 0
+        sleepBlocker.setBusy(agentWorkRunning)
       },
-      terminal,
-      localFiles: {
-        request: async (call, request, signal) => {
-          const generation = captureAccountDataGeneration()
-          const origin = appOrigin()
-          const authorization = { toolName: call.toolName, args: call.args }
-          try {
-            const access = await localFilePermissions.authorize(authorization, {
-              parent: async () => getMainWindow(),
-              origin,
-              generation,
-              signal,
-              isCurrent: () =>
-                isAccountDataGenerationCurrent(generation) &&
-                accountDataAvailable() &&
-                appOrigin() === origin,
-              revalidate: () => desktopExecutor.revalidateCall(call),
+      // A result the model has makes a tmux run it handed back as still going collectable across a
+      // restart.
+      onResultDelivered: (toolCallId) => terminal.markRunDelivered(toolCallId),
+      // A result the model never got leaves such a run with no one to come back to it, so it is
+      // stopped, as the launch sweep stops a previous process's.
+      onResultNotDelivered: (toolCallId) => void terminal.stopUndeliveredRun(toolCallId),
+      runner: createDesktopToolRunner({
+        preferences: () => desktopSettings.getPreferences(),
+        accountDataAvailable,
+        browser: {
+          // A background call names no window, so the chat's browser is bound to this account here.
+          executeTool: (scopeId, tool, params, toolCallId) => {
+            bindBrowserScopeProfile(scopeId, browserProfile())
+            return executeAgentBrowserTool(scopeId, tool, params, toolCallId, undefined, {
+              background: true,
             })
-            return await executeLocalFileRequest(request, authorization, access)
-          } catch (error) {
-            return { ok: false, error: getErrorMessage(error) }
-          }
+          },
+          cancelTool: cancelAgentBrowserTool,
+          hasSession: hasBrowserScopeSession,
+          restoreScope: (scopeId) => {
+            bindBrowserScopeProfile(scopeId, browserProfile())
+            return restoreAgentBrowserScope(scopeId)
+          },
         },
-      },
-      imports: {
-        importEntry: (request, signal) => desktopExecutor.importEntry(request, signal),
-      },
-      localFilesystem: {
-        handle: (request) => localFilesystem.handle(request),
-        vfsRoot: mountVfsRoot,
-      },
-    }),
-  })
+        terminal,
+        localFiles: {
+          request: async (call, request, signal) => {
+            const generation = captureAccountDataGeneration()
+            const origin = account.origin
+            const authorization = { toolName: call.toolName, args: call.args }
+            try {
+              const access = await localFilePermissionsFor(account).authorize(authorization, {
+                parent: async () => mainWindowFor(account) ?? getMainWindow(),
+                origin,
+                generation,
+                signal,
+                isCurrent: () =>
+                  isAccountDataGenerationCurrent(generation) &&
+                  accountDataAvailable() &&
+                  account.origin === origin &&
+                  accountById(account.id) !== undefined,
+                revalidate: () => service.revalidateCall(call),
+              })
+              return await executeLocalFileRequest(request, authorization, access)
+            } catch (error) {
+              return { ok: false, error: getErrorMessage(error) }
+            }
+          },
+        },
+        imports: {
+          importEntry: (request, signal) => service.importEntry(request, signal),
+        },
+        localFilesystem: {
+          handle: (request) => localFilesystemFor(account).handle(request),
+          vfsRoot: mountVfsRoot,
+        },
+      }),
+    })
+    executors.set(account.id, { service, approvals: approvalNotifier, started: false })
+    if (executorsStarted) startExecutor(account)
+    return service
+  }
+
+  /** Stops the account's background work, forgets its calls, and retires its install id. */
+  async function signOutExecutor(account: Account): Promise<void> {
+    executorFor(account)
+    const entry = executors.get(account.id)
+    entry?.approvals.clear()
+    await entry?.service.signOut()
+  }
+
+  /** Starts an account's executor once, and re-registers it whenever its session cookie rotates. */
+  function startExecutor(account: Account): void {
+    executorFor(account)
+    const entry = executors.get(account.id)
+    if (!entry || entry.started) return
+    entry.started = true
+    // A sign-in, or a session rotation, binds the device to the new session.
+    ensureRuntime(account).session.cookies.on('changed', (_event, cookie, _cause, removed) => {
+      if (!removed && isSessionCookieName(cookie.name)) entry.service.refreshRegistration()
+    })
+    entry.service.start()
+  }
+
+  function refreshExecutorRegistrations(): void {
+    for (const { service } of executors.values()) service.refreshRegistration()
+  }
 
   const serverWindow = createServerWindow({
     config,
@@ -1214,7 +1269,12 @@ function main(): void {
                 },
               },
               { label: 'browser sign-in handoffs', clear: clearSignIns },
-              { label: 'background executor', clear: () => desktopExecutor.signOut() },
+              {
+                label: 'background executor',
+                clear: async () => {
+                  await Promise.all(accounts().map(signOutExecutor))
+                },
+              },
               {
                 label: 'terminal sessions',
                 clear: async () => {
@@ -1255,7 +1315,9 @@ function main(): void {
     // The same user's tmux runs from a previous process: one whose pane the model has, or will get
     // from recovery, is left to the model, which may come back to it; any other has nothing left
     // to collect what it does, so it is stopped, while its pane still carries its tag.
-    void desktopExecutor.pendingResults().then((pending) => terminal.stopUncollectableRuns(pending))
+    void Promise.all(accounts().map((account) => executorFor(account).pendingResults())).then(
+      (pending) => terminal.stopUncollectableRuns(new Set(pending.flatMap((ids) => [...ids])))
+    )
 
     if (!accountDataAvailable()) {
       logger.warn(
@@ -1409,14 +1471,11 @@ function main(): void {
         getConfiguration: () => serverWindow.getConfiguration(),
         setOrigin: (origin) => serverWindow.setOrigin(origin),
       },
-      getExecutorDevice: () => desktopExecutor.getDevice(),
+      getExecutorDevice: (sender) => executorFor(accountForContents(sender)).getDevice(),
     })
     if (accountDataAvailable()) {
-      // A sign-in, or a session rotation, binds the device to the new session.
-      primaryRuntime().session.cookies.on('changed', (_event, cookie, _cause, removed) => {
-        if (!removed && isSessionCookieName(cookie.name)) desktopExecutor.refreshRegistration()
-      })
-      desktopExecutor.start()
+      executorsStarted = true
+      for (const account of accounts()) startExecutor(account)
     }
     // Every account gets a window: the primary where it was, the rest cascaded.
     await ensureMainWindow()

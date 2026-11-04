@@ -415,7 +415,7 @@ export interface IpcDeps {
     setOrigin: (origin: string) => Promise<DesktopServerChangeResult>
   }
   /** The device a new chat turn may bind to, or null while Sim has not enabled one. */
-  getExecutorDevice: () => DesktopExecutorDevice | null
+  getExecutorDevice: (sender: WebContents) => DesktopExecutorDevice | null
 }
 
 /**
@@ -908,8 +908,9 @@ export function registerIpcHandlers(deps: IpcDeps): void {
     'desktop-executor:get-device': {
       kind: 'invoke',
       gate: 'app-origin',
+      passSender: true,
       denied: null,
-      handler: () => deps.getExecutorDevice(),
+      handler: (sender) => deps.getExecutorDevice(sender as WebContents),
     },
     'desktop:settings:get': {
       kind: 'invoke',
